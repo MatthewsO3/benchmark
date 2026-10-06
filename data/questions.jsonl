@@ -1,0 +1,10 @@
+{"id": "q1", "question": "Does the repository use the Open3D library for point-to-mesh distance computation?", "expected": "yes"}
+{"id": "q2", "question": "Is there a function named run_verification in backend/pipeline.py?", "expected": "yes"}
+{"id": "q3", "question": "Is the default CLASSIFICATION_CODE in backend/settings.py equal to 9200?", "expected": "yes"}
+{"id": "q4", "question": "Does the project read E57 point cloud files?", "expected": "yes"}
+{"id": "q5", "question": "Is the frontend built with Streamlit?", "expected": "yes"}
+{"id": "q6", "question": "Does load_e57_points perform voxel downsampling?", "expected": "yes"}
+{"id": "q7", "question": "Does the code collect IfcBuildingElementProxy elements by classification?", "expected": "yes"}
+{"id": "q8", "question": "Is the default VOXEL_SIZE in backend/settings.py equal to 0.5 meters?", "expected": "no"}
+{"id": "q9", "question": "Does the pipeline generate both a CSV and an HTML report?", "expected": "yes"}
+{"id": "q10", "question": "Does the project use a PostgreSQL database to store results?", "expected": "no"}

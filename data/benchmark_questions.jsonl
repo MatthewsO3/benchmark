@@ -1,0 +1,48 @@
+{"id": "q1", "question": "Does the function verify_elements exist in backend/algorithms/verifier.py?", "expected": "yes"}
+{"id": "q2", "question": "Is the classification code used to filter elements in this project \"9200\"?", "expected": "yes"}
+{"id": "q3", "question": "Does collect_classified_proxy_elements in backend/ingestion/ifc_reader.py search for elements of IFC type IfcBuildingElementProxy?", "expected": "yes"}
+{"id": "q4", "question": "Is the function load_e57_points defined in backend/ingestion/e57_reader.py?", "expected": "yes"}
+{"id": "q5", "question": "Does the project use the ifcopenshell library to read IFC files?", "expected": "yes"}
+{"id": "q6", "question": "Does the project use the trimesh library to build meshes from IFC geometry?", "expected": "no"}
+{"id": "q7", "question": "Is Open3D's RaycastingScene used to compute point-to-mesh distances in backend/geometry/raycaster.py?", "expected": "yes"}
+{"id": "q8", "question": "Does compute_confidence in backend/algorithms/confidence.py return a value in the range 0 to 100?", "expected": "yes"}
+{"id": "q9", "question": "Is BUILT_CONFIDENCE set to 75.0 in backend/settings.py?", "expected": "yes"}
+{"id": "q10", "question": "Is MIN_CLOSE_POINTS_BUILT set to 100 in backend/settings.py?", "expected": "no"}
+{"id": "q11", "question": "Does classify_status in confidence.py ever return the string \"Beépült\"?", "expected": "yes"}
+{"id": "q12", "question": "Does classify_status in confidence.py ever return the string \"Built\" (in English)?", "expected": "no"}
+{"id": "q13", "question": "Is the final VisibleSurfaceQuality score in visible_quality.py computed as a weighted sum of distance_score, patch_coverage_score, and density_score?", "expected": "yes"}
+{"id": "q14", "question": "Does distance_score in backend/algorithms/visible_quality.py return 100.0 when the avg_distance to tolerance ratio is less than or equal to 0.25?", "expected": "yes"}
+{"id": "q15", "question": "In verifier.py, is the overall confidence computed as 0.7 times base_confidence plus 0.3 times VisibleSurfaceQuality?", "expected": "yes"}
+{"id": "q16", "question": "In verifier.py, is the overall confidence computed as a simple average (50/50) of base_confidence and VisibleSurfaceQuality?", "expected": "no"}
+{"id": "q17", "question": "Does bbox_coverage_ratio in backend/geometry/coverage.py divide the element's bounding box into a grid and count occupied cells?", "expected": "yes"}
+{"id": "q18", "question": "Is the default value of GRID_DIVISIONS in backend/settings.py equal to 4?", "expected": "yes"}
+{"id": "q19", "question": "Does surface_coverage_ratio in backend/geometry/surface_coverage.py use a cKDTree from scipy.spatial to query nearest neighbors?", "expected": "yes"}
+{"id": "q20", "question": "Does the E57 reader module use a library called \"pye57\" to read point cloud scans?", "expected": "yes"}
+{"id": "q21", "question": "Does load_e57_points raise a RuntimeError if no points could be read from the E57 file?", "expected": "yes"}
+{"id": "q22", "question": "Is voxel_downsample in e57_reader.py marked as deprecated in its docstring?", "expected": "yes"}
+{"id": "q23", "question": "Does write_scan_properties in backend/output/writers/ifc_writer.py write a property set named \"Pset_ScanVerification\" to the IFC model?", "expected": "yes"}
+{"id": "q24", "question": "Does write_scan_properties write a property set named \"Pset_PointCloudCheck\" to the IFC model?", "expected": "no"}
+{"id": "q25", "question": "Does save_csv_report in backend/output/reports/csv_report.py use pandas to write the CSV file?", "expected": "yes"}
+{"id": "q26", "question": "Does save_html_report in backend/output/reports/html_report.py use the jinja2 templating engine to render HTML?", "expected": "no"}
+{"id": "q27", "question": "Does run_verification in backend/pipeline.py use a tempfile.TemporaryDirectory to store intermediate files?", "expected": "yes"}
+{"id": "q28", "question": "Does run.py launch the Streamlit app via subprocess by running \"streamlit run\"?", "expected": "yes"}
+{"id": "q29", "question": "Is frontend/app.py responsible for defining the Streamlit page config and sidebar inputs?", "expected": "yes"}
+{"id": "q30", "question": "Does frontend/components/report.py define a function named build_report?", "expected": "yes"}
+{"id": "q31", "question": "Does frontend/components/report.py define a function named export_pdf_report?", "expected": "no"}
+{"id": "q32", "question": "Is the project's required Python version restricted to exactly 3.12 in pyproject.toml?", "expected": "yes"}
+{"id": "q33", "question": "Is pytest listed as a dev dependency in pyproject.toml?", "expected": "no"}
+{"id": "q34", "question": "Is ruff configured with a line-length of 100 in pyproject.toml?", "expected": "yes"}
+{"id": "q35", "question": "Does the project's version in pyproject.toml equal \"0.5.0\"?", "expected": "yes"}
+{"id": "q36", "question": "Does verifier.py set the result field \"ScanStatus\" to \"Nincs geometria\" when an element has no IFC Representation?", "expected": "yes"}
+{"id": "q37", "question": "Does the EngineVersion string hardcoded in verifier.py equal \"0.6\"?", "expected": "yes"}
+{"id": "q38", "question": "Does verify_elements catch ValueError, RuntimeError, and AttributeError exceptions when processing an element?", "expected": "yes"}
+{"id": "q39", "question": "Is there a class named TimerReport defined in backend/utils/timer.py?", "expected": "yes"}
+{"id": "q40", "question": "Is there a class named PerformanceLogger defined in backend/utils/timer.py?", "expected": "no"}
+{"id": "q41", "question": "Does element_to_mesh in backend/geometry/mesh_builder.py raise a ValueError when the element has no usable mesh geometry?", "expected": "yes"}
+{"id": "q42", "question": "Does candidate_points_for_vertices in bbox_filter.py use a KD-tree query_ball_point call to prefilter candidate points?", "expected": "yes"}
+{"id": "q43", "question": "Does the codebase overall represent a tool that cross-checks IFC building model elements against real-world point cloud scan data to verify construction status?", "expected": "yes"}
+{"id": "q44", "question": "Is this codebase primarily a machine learning training pipeline for image classification?", "expected": "no"}
+{"id": "q45", "question": "Does the SURFACE_TOLERANCE default setting equal 0.05 (5 cm) in backend/settings.py?", "expected": "yes"}
+{"id": "q46", "question": "Does the project include a sample IFC file at data/ifc/model.ifc?", "expected": "yes"}
+{"id": "q47", "question": "Does the project include a sample point cloud file at data/pointcloud/scan.e57?", "expected": "yes"}
+{"id": "q48", "question": "Is the CI workflow file located at .github/workflows/ci.yaml?", "expected": "yes"}
