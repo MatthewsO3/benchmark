@@ -1,0 +1,5 @@
+
+
+################################################################################
+# QUESTION (tool=grep_tool): Does load_e57_points raise a RuntimeError if no points could be read from the E57 file?
+################################################################################
