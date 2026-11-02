@@ -41,19 +41,27 @@ def apply_cache_mode(system_prompt: str, cache_mode: str) -> str:
 
 
 class AgentCall:
-    """Result of the forced-tool agent call.
+    """Result of a single agent turn (one LLM call in the tool-call loop).
 
     :param reasoning: The model's reasoning trace (empty if none returned).
-    :param tool_name: Name of the tool the model called, or ``None``.
+    :param tool_name: Name of the tool the model called, or ``None`` if it
+        chose not to call a tool (only possible on non-forced rounds).
     :param tool_args: Parsed arguments for the tool call, or ``None``.
+    :param tool_call_id: Provider id of the tool call, needed to attach the
+        tool result back into the message history, or ``None``.
+    :param assistant_message: The raw assistant message dict to append to the
+        running message history for the next round.
     :param system_prompt: The system prompt actually sent (for the transcript).
     :param usage: Token/cost accounting for the call.
     """
 
-    def __init__(self, *, reasoning, tool_name, tool_args, system_prompt, usage):
+    def __init__(self, *, reasoning, tool_name, tool_args, tool_call_id,
+                 assistant_message, system_prompt, usage):
         self.reasoning = reasoning
         self.tool_name = tool_name
         self.tool_args = tool_args
+        self.tool_call_id = tool_call_id
+        self.assistant_message = assistant_message
         self.system_prompt = system_prompt
         self.usage = usage
 
@@ -87,7 +95,9 @@ class LLMClient:
         self.max_retries = max_retries
         self.base_delay = base_delay
         # Raw SDK client for the agent call (reads the `reasoning` field).
-        self._openai = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY)
+        # timeout so a hung round surfaces as an error instead of blocking.
+        self._openai = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY,
+                              timeout=120.0)
         # langchain client for the answerer call (we handle retries ourselves).
         self._answerer = ChatOpenAI(
             model=config.LLM_MODEL,
@@ -95,6 +105,8 @@ class LLMClient:
             base_url=config.LLM_BASE_URL,
             api_key=config.LLM_API_KEY,
             max_retries=0,
+            timeout=120.0,
+            max_tokens=config.ANSWERER_MAX_TOKENS,
         )
 
     def _retry(self, operation):
@@ -118,43 +130,82 @@ class LLMClient:
                             attempt + 1, self.max_retries, delay)
                 time.sleep(delay)
 
-    def call_agent(self, *, system_prompt, question, tool_schema, tool_name, cache_mode):
-        """Force exactly one call to ``tool_name`` and capture the reasoning.
+    def _request_agent(self, messages, tool_schema, tool_choice):
+        """Make one raw agent completion and validate the response shape.
 
-        :param system_prompt: System prompt for the agent.
-        :param question: The user question.
-        :param tool_schema: OpenAI-format JSON schema for the tool.
-        :param tool_name: Name of the tool the model is forced to call.
-        :param cache_mode: ``"on"`` or ``"off"`` (see :func:`apply_cache_mode`).
-        :return: An :class:`AgentCall`.
+        OpenRouter surfaces provider errors (incl. rate limits) in the response
+        body with ``choices=None`` rather than an HTTP error, which would crash
+        on ``response.choices[0]``. Detect that and raise so :meth:`_retry` can
+        back off on rate limits or fail loudly otherwise.
+
+        :raises RuntimeError: If the provider returned no choices.
         """
-        sent_prompt = apply_cache_mode(system_prompt, cache_mode)
-        response = self._retry(lambda: self._openai.chat.completions.create(
+        response = self._openai.chat.completions.create(
             model=self.model,
             temperature=self.temperature,
-            messages=[
-                {"role": "system", "content": sent_prompt},
-                {"role": "user", "content": question},
-            ],
+            max_tokens=config.AGENT_MAX_TOKENS,
+            messages=messages,
             tools=[tool_schema],
-            tool_choice={"type": "function", "function": {"name": tool_name}},
+            tool_choice=tool_choice,
             extra_body={"reasoning": {"enabled": True}, "usage": {"include": True}},
-        ))
+        )
+        if not getattr(response, "choices", None):
+            err = getattr(response, "error", None) or getattr(response, "model_extra", {})
+            raise RuntimeError(f"provider returned no choices: {err}")
+        return response
+
+    def call_agent(self, *, messages, tool_schema, tool_name, force):
+        """Run one agent turn over ``messages`` and capture the reasoning.
+
+        One LLM call in the tool-call loop. On the first round ``force`` is
+        ``True`` so the model must call ``tool_name``; on later rounds it is
+        ``False`` (``tool_choice="auto"``) so the model may call the same tool
+        again or stop (return no tool call). Only ``tool_schema`` is offered, so
+        ``auto`` can never pick a different tool.
+
+        :param messages: The running chat history (list of message dicts). Not
+            mutated; the caller appends :attr:`AgentCall.assistant_message` and
+            any tool result itself.
+        :param tool_schema: OpenAI-format JSON schema for the single tool.
+        :param tool_name: Name of the tool (forced on round 1).
+        :param force: Whether to force the tool call this round.
+        :return: An :class:`AgentCall`.
+        """
+        tool_choice = (
+            {"type": "function", "function": {"name": tool_name}} if force else "auto"
+        )
+        response = self._retry(lambda: self._request_agent(messages, tool_schema, tool_choice))
 
         message = response.choices[0].message
-        called_name, called_args = None, None
+        called_name, called_args, call_id = None, None, None
+        # Reconstruct a minimal, replay-safe assistant message. The raw
+        # model_dump() carries provider-only fields (reasoning,
+        # reasoning_details, annotations) that are invalid in a request
+        # message and can make the backend hang/reject on the next round.
+        assistant_message = {"role": "assistant", "content": message.content or ""}
         if message.tool_calls:
             call = message.tool_calls[0]
             called_name = call.function.name
+            call_id = call.id
             try:
                 called_args = json.loads(call.function.arguments or "{}")
             except json.JSONDecodeError:
                 called_args = {}
+            assistant_message["tool_calls"] = [{
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.function.name,
+                    "arguments": call.function.arguments or "{}",
+                },
+            }]
         return AgentCall(
             reasoning=(getattr(message, "reasoning", None) or "").strip(),
             tool_name=called_name,
             tool_args=called_args,
-            system_prompt=sent_prompt,
+            tool_call_id=call_id,
+            assistant_message=assistant_message,
+            system_prompt=None,
             usage=TokenUsage.from_openai_usage(response.usage),
         )
 

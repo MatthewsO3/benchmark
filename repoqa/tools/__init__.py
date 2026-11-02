@@ -8,11 +8,12 @@ import logging
 from .grep import grep_tool
 from .lsp import lsp_tool, lsp_server
 from .rag import rag_tool, rag_index
+from .shell import shell_tool
 
 log = logging.getLogger("repoqa.tools")
 
 #: All benchmarked tools, in display order.
-ALL_TOOLS = [grep_tool, lsp_tool, rag_tool]
+ALL_TOOLS = [grep_tool, lsp_tool, rag_tool, shell_tool]
 #: Names of all benchmarked tools.
 TOOL_NAMES = [t.name for t in ALL_TOOLS]
 

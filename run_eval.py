@@ -21,8 +21,16 @@ def main() -> None:
         "--cache", choices=["on", "off"], default=None, dest="cache_mode",
         help="prompt caching: 'on' (stable prefix, cheaper re-runs) or 'off' "
              "(nonce prefix, reproducible cold cost). Defaults to config.CACHE_MODE.")
+    parser.add_argument(
+        "--rounds", "-n", type=int, default=None, dest="max_rounds",
+        help="max agent tool-call rounds n (round 1 forces the tool, rounds "
+             "2..n are optional and may stop early). Defaults to config.AGENT_ROUNDS.")
+    parser.add_argument(
+        "--log", "-o", default=None, dest="log_path",
+        help="transcript output file path (default: logs/run_<timestamp>.log)")
     args = parser.parse_args()
-    run_benchmark(questions_path=args.questions, cache_mode=args.cache_mode)
+    run_benchmark(questions_path=args.questions, cache_mode=args.cache_mode,
+                  max_rounds=args.max_rounds, log_path=args.log_path)
 
 
 if __name__ == "__main__":

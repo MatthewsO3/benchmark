@@ -1,109 +1,66 @@
-"""Human-readable transcript logging for a benchmark run.
+"""JSONL transcript logging for a benchmark run.
 
-Each run writes one timestamped file under ``logs/`` containing the full
-prompt, reasoning, tool output and answer for every question, so you can see
-exactly why a tool produced a given answer.
+Each run writes one ``.jsonl`` file: one JSON object per line. Per-question
+records capture everything needed to reconstruct the run — the exact prompts,
+every agent round's reasoning / tool args / full tool output, the answerer's
+context and output, token usage and latency. A final ``summary`` record holds
+the aggregated per-tool metrics the plotter consumes.
+
+JSONL (rather than a flat text log) keeps records queryable and avoids the
+duplication that made the old text logs balloon to thousands of lines.
 """
 import os
+import json
 from datetime import datetime
-
-_WIDE = 80
 
 
 class Transcript:
-    """Append-only writer for a single run's transcript.
+    """Append-only JSONL writer for a single run.
 
-    :param directory: Directory to create the log file in (created if missing).
+    :param directory: Directory to create the file in (created if missing).
+        Ignored when ``path`` is given.
+    :param path: Explicit output file path (overrides the timestamped default).
+        Its parent directory is created if missing.
     """
 
-    def __init__(self, *, directory: str = "logs"):
-        os.makedirs(directory, exist_ok=True)
-        self.path = os.path.join(directory, f"run_{datetime.now():%Y%m%d_%H%M%S}.log")
+    def __init__(self, *, directory: str = "logs", path: str = None):
+        if path:
+            parent = os.path.dirname(os.path.abspath(path))
+            os.makedirs(parent, exist_ok=True)
+            self.path = path
+        else:
+            os.makedirs(directory, exist_ok=True)
+            self.path = os.path.join(directory, f"run_{datetime.now():%Y%m%d_%H%M%S}.jsonl")
 
-    def write(self, line: str = "") -> None:
-        """Append one line to the transcript.
+    def record(self, obj: dict) -> None:
+        """Append one JSON object as a line.
 
-        :param line: Text to write; a trailing newline is added.
+        :param obj: A JSON-serializable record.
         """
         with open(self.path, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+            handle.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-    def question(self, *, tool: str, cache_mode: str, question: str) -> None:
-        """Write the banner that opens a question's section.
+    def meta(self, **fields) -> None:
+        """Write a run-level metadata record (``type="meta"``).
 
-        :param tool: The tool under test.
+        :param fields: Arbitrary metadata (cache mode, round budget, ...).
+        """
+        self.record({"type": "meta", **fields})
+
+    def question_record(self, *, record: dict) -> None:
+        """Write a per-question record (``type="question"``).
+
+        :param record: The fully-populated question record (see
+            :func:`repoqa.agent.answer_question`).
+        """
+        self.record({"type": "question", **record})
+
+    def summary(self, *, cache_mode: str, max_rounds: int, tools: dict) -> None:
+        """Write the aggregated per-tool summary record (``type="summary"``).
+
         :param cache_mode: The active cache mode.
-        :param question: The question text.
+        :param max_rounds: The round budget ``n`` for the run.
+        :param tools: Mapping of tool name to its summary dict.
         """
-        self.write("\n\n" + "#" * _WIDE)
-        self.write(f"# QUESTION (tool={tool}, cache={cache_mode}): {question}")
-        self.write("#" * _WIDE)
-
-    def agent_call(self, *, tool: str, question: str, agent) -> None:
-        """Record the forced-tool agent call (call #1).
-
-        :param tool: The tool under test.
-        :param question: The question text.
-        :param agent: The :class:`~repoqa.llm.AgentCall` returned.
-        """
-        usage = agent.usage
-        self.write("\n" + "=" * _WIDE)
-        self.write(f"TOOL={tool} | LLM CALL #1 | agent, forced tool (raw SDK, reasoning on)")
-        self.write(f"TOKENS: input={usage.input_tokens} output={usage.output_tokens} "
-                   f"total={usage.total_tokens} cached={usage.cached_tokens} "
-                   f"cost=${usage.cost_usd:.6f}")
-        self.write("-" * _WIDE)
-        self.write("INPUT MESSAGES:")
-        self.write(f"  [system]\n    {agent.system_prompt}")
-        self.write(f"  [user]\n    {question}")
-        self.write("-" * _WIDE)
-        self.write("REASONING:")
-        self.write(f"  {agent.reasoning or '(none)'}")
-        self.write(f"  tool_call={{'name': {agent.tool_name!r}, 'args': {agent.tool_args!r}}}")
-        self.write("=" * _WIDE)
-
-    def tool_execution(self, *, tool: str, args, output: str) -> None:
-        """Record a tool invocation and its raw output.
-
-        :param tool: The tool name.
-        :param args: The arguments the tool was called with.
-        :param output: The tool's textual output.
-        """
-        self.write("\n" + "-" * _WIDE)
-        self.write(f"TOOL EXECUTION: {tool} args={args}")
-        self.write(f"TOOL OUTPUT ({len(output)} chars):")
-        self.write(output)
-        self.write("-" * _WIDE)
-
-    def answerer_call(self, *, tool: str, answerer) -> None:
-        """Record the tool-free answerer call (call #2).
-
-        :param tool: The tool under test.
-        :param answerer: The :class:`~repoqa.llm.AnswererCall` returned.
-        """
-        usage = answerer.usage
-        self.write("\n" + "=" * _WIDE)
-        self.write(f"TOOL={tool} | LLM CALL #2 | answerer, no tools")
-        self.write(f"TOKENS: input={usage.input_tokens} output={usage.output_tokens} "
-                   f"total={usage.total_tokens} cached={usage.cached_tokens} "
-                   f"cost=${usage.cost_usd:.6f}")
-        self.write("-" * _WIDE)
-        self.write("INPUT MESSAGES:")
-        self.write(f"  [system]\n    {answerer.system_prompt}")
-        self.write(f"  [user]\n    {answerer.context}")
-        self.write("-" * _WIDE)
-        self.write("OUTPUT:")
-        self.write(f"  {answerer.text}")
-        self.write("=" * _WIDE)
-
-    def final(self, *, answer: str, usage, latency_s: float) -> None:
-        """Write the one-line summary that closes a question's section.
-
-        :param answer: The normalized one-word answer.
-        :param usage: Combined :class:`~repoqa.usage.TokenUsage` for both calls.
-        :param latency_s: Wall-clock time for both calls, in seconds.
-        """
-        self.write(f"\n>>> FINAL answer={answer!r} "
-                   f"tokens in/out/total={usage.input_tokens}/{usage.output_tokens}/"
-                   f"{usage.total_tokens} cached={usage.cached_tokens} "
-                   f"cost=${usage.cost_usd:.6f} time={latency_s}s")
+        self.record({"type": "summary", "cache_mode": cache_mode,
+                     "max_rounds": max_rounds, "tools": tools})

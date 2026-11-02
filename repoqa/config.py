@@ -20,6 +20,26 @@ LLM_MODEL = os.getenv("LLM_MODEL", "deepseek/deepseek-v4-flash-0731:free")
 #: Sampling temperature. Kept at 0 for reproducible benchmarking.
 LLM_TEMPERATURE = 0.0
 
+# -- Agent loop ---------------------------------------------------------------
+
+#: Maximum number of agent tool-call rounds (``n``). Round 1 forces the tool;
+#: rounds 2..n let the model call it again or stop early. Override via
+#: ``AGENT_ROUNDS`` in ``.env`` or the ``--rounds`` CLI flag.
+AGENT_ROUNDS = int(os.getenv("AGENT_ROUNDS", "2"))
+
+# -- Output token caps --------------------------------------------------------
+
+#: Cap on *generated* tokens per call. This never limits the input/context fed
+#: to the model — only how much it may produce — so it does not change results
+#: as long as it stays above what the model actually generates. It mainly stops
+#: the provider from pre-authorizing the model's full context window (which can
+#: trigger spurious 402 "insufficient credits" errors) and bounds cost.
+#: Set generously; raise via ``.env`` if you ever see truncated output.
+AGENT_MAX_TOKENS = int(os.getenv("AGENT_MAX_TOKENS", "4096"))
+#: Cap for the answerer call, which only needs a single ``yes``/``no`` word
+#: (kept well above that to tolerate a verbose/non-compliant model).
+ANSWERER_MAX_TOKENS = int(os.getenv("ANSWERER_MAX_TOKENS", "512"))
+
 # -- Target repository --------------------------------------------------------
 
 #: Path to the codebase the questions are about.

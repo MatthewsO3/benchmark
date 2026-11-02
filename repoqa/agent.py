@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
 from . import config
-from .llm import LLMClient
+from .llm import LLMClient, apply_cache_mode
 from .transcript import Transcript
 from .usage import TokenUsage
 from .tools import get_tool
@@ -57,6 +57,9 @@ class QuestionResult:
     :param tool_output: The raw tool output.
     :param usage: Combined token/cost accounting for both calls.
     :param latency_s: Wall-clock time for both calls, in seconds.
+    :param rounds_used: Number of tool-call rounds actually used (early-stop
+        aware; may be less than ``max_rounds``).
+    :param max_rounds: Maximum tool-call rounds allowed (``n``).
     """
 
     question: str
@@ -67,74 +70,201 @@ class QuestionResult:
     tool_output: str
     usage: TokenUsage
     latency_s: float
+    rounds_used: int = 0
+    max_rounds: int = 0
 
 
 def answer_question(*, question: str, tool_name: str, client: LLMClient,
-                    transcript: Transcript, cache_mode: str = None) -> QuestionResult:
-    """Run the two-call loop for one question and record it to the transcript.
+                    transcript: Transcript, cache_mode: str = None,
+                    max_rounds: int = None, question_id: str = None,
+                    expected: str = None) -> QuestionResult:
+    """Run the multi-round agent loop for one question and record it.
+
+    The agent may call the single tool under test up to ``max_rounds`` (``n``)
+    times. Round 1 forces the tool so one is always exercised; rounds 2..n use
+    ``tool_choice="auto"`` so the model may call the same tool again or stop
+    early when it decides it has enough evidence. The number of rounds actually
+    used is recorded for metrics. A final tool-free answerer call collapses the
+    question + accumulated reasoning + tool outputs into one ``yes``/``no`` word.
 
     :param question: The question to answer.
     :param tool_name: Name of the single tool to use (``grep_tool`` etc.).
     :param client: The :class:`~repoqa.llm.LLMClient` to use.
     :param transcript: The :class:`~repoqa.transcript.Transcript` to log to.
     :param cache_mode: ``"on"``/``"off"``; defaults to :data:`config.CACHE_MODE`.
+    :param max_rounds: Max tool-call rounds (``n``); defaults to
+        :data:`config.AGENT_ROUNDS`.
     :return: The :class:`QuestionResult`.
     """
     tool = get_tool(tool_name)
     cache_mode = (cache_mode or config.CACHE_MODE).lower()
+    max_rounds = max_rounds or config.AGENT_ROUNDS
     tool_schema = convert_to_openai_tool(tool)
 
-    transcript.question(tool=tool_name, cache_mode=cache_mode, question=question)
     start = time.perf_counter()
 
-    # Phase 1: the agent is forced to call the single tool under test.
-    log.info("[%s] LLM call #1 (forced tool) model=%s", tool_name, client.model)
-    agent = client.call_agent(
-        system_prompt=config.SYSTEM_PROMPT,
-        question=question,
-        tool_schema=tool_schema,
-        tool_name=tool_name,
-        cache_mode=cache_mode,
-    )
-    transcript.agent_call(tool=tool_name, question=question, agent=agent)
+    # Build the running chat history the agent loop extends each round.
+    system_prompt = apply_cache_mode(config.SYSTEM_PROMPT, cache_mode)
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
 
-    tool_output = ""
-    if agent.tool_name:
-        log.info("[%s] tool call args=%s", tool_name, agent.tool_args)
-        tool_output = str(tool.invoke(agent.tool_args or {}))
-        log.info("[%s] tool result: %d chars", tool_name, len(tool_output))
-        transcript.tool_execution(tool=tool_name, args=agent.tool_args, output=tool_output)
-    else:
-        log.warning("[%s] model did not call the tool", tool_name)
+    usage = TokenUsage()
+    reasoning_parts = []
+    tool_output_parts = []
+    rounds_used = 0
+    rounds_log = []  # structured per-round detail for the JSONL record
 
-    # Phase 2: tool-free answerer. The agent's own reasoning is forwarded so it
-    # still contributes to the final answer, alongside the raw tool output.
+    for round_no in range(1, max_rounds + 1):
+        force = round_no == 1  # round 1 forces the tool; later rounds are auto.
+        log.info("[%s] LLM call (agent round %d/%d, %s) model=%s",
+                 tool_name, round_no, max_rounds,
+                 "forced" if force else "auto", client.model)
+        agent = client.call_agent(
+            messages=messages,
+            tool_schema=tool_schema,
+            tool_name=tool_name,
+            force=force,
+        )
+        usage = usage + agent.usage
+        if agent.reasoning:
+            reasoning_parts.append(f"[round {round_no}] {agent.reasoning}")
+
+        round_entry = {
+            "round": round_no,
+            "forced": force,
+            "reasoning": agent.reasoning,
+            "tool_name": agent.tool_name,
+            "tool_args": agent.tool_args,
+            "tool_output": None,
+            "usage": {
+                "input": agent.usage.input_tokens,
+                "output": agent.usage.output_tokens,
+                "total": agent.usage.total_tokens,
+                "cached": agent.usage.cached_tokens,
+                "cost_usd": agent.usage.cost_usd,
+            },
+        }
+
+        # Keep the assistant turn in history for the next round.
+        messages.append(agent.assistant_message)
+
+        if not agent.tool_name:
+            # Model chose to stop (only possible on auto rounds). Early exit.
+            round_entry["stopped_early"] = True
+            rounds_log.append(round_entry)
+            log.info("[%s] agent stopped after %d round(s) (no tool call)",
+                     tool_name, round_no - 1 if round_no > 1 else round_no)
+            if round_no == 1:
+                log.warning("[%s] model did not call the tool on forced round", tool_name)
+            else:
+                # Drop the trailing assistant turn that carried no tool call.
+                messages.pop()
+            break
+
+        rounds_used = round_no
+        log.info("[%s] round %d tool call args=%s", tool_name, round_no, agent.tool_args)
+        try:
+            round_output = str(tool.invoke(agent.tool_args or {}))
+        except Exception as exc:  # noqa: BLE001
+            # A weak model sometimes emits a malformed tool call (e.g. empty
+            # args missing a required field). Don't crash the whole run: record
+            # the failure as this round's "output" and feed it back so the model
+            # can correct itself on the next round.
+            round_output = f"tool error: invalid arguments {agent.tool_args!r}: {exc}"
+            round_entry["tool_error"] = str(exc)
+            log.warning("[%s] round %d tool call failed (%s)", tool_name, round_no, exc)
+        else:
+            log.info("[%s] round %d tool result: %d chars",
+                     tool_name, round_no, len(round_output))
+        round_entry["tool_output"] = round_output
+        rounds_log.append(round_entry)
+        tool_output_parts.append(f"[round {round_no}] {round_output}")
+
+        # Feed the tool result back so the next round can build on it.
+        messages.append({
+            "role": "tool",
+            "tool_call_id": agent.tool_call_id,
+            "content": round_output,
+        })
+
+    reasoning = "\n\n".join(reasoning_parts)
+    tool_output = "\n\n".join(tool_output_parts)
+
+    # Final call: tool-free answerer. All accumulated reasoning and tool output
+    # is forwarded so every round contributes to the final answer.
     context = (
         f"QUESTION:\n{question}\n\n"
-        f"AGENT REASONING:\n{agent.reasoning or '(none)'}\n\n"
+        f"AGENT REASONING:\n{reasoning or '(none)'}\n\n"
         f"TOOL CONTEXT:\n{tool_output or '(none)'}"
     )
-    log.info("[%s] LLM call #2 (answerer, no tools)", tool_name)
+    log.info("[%s] LLM call (answerer, no tools) after %d round(s)",
+             tool_name, rounds_used)
     answerer = client.call_answerer(
         system_prompt=config.ANSWERER_SYSTEM_PROMPT,
         context=context,
         cache_mode=cache_mode,
     )
-    transcript.answerer_call(tool=tool_name, answerer=answerer)
+    usage = usage + answerer.usage
 
+    answer = normalize_answer(answerer.text)
+    latency_s = round(time.perf_counter() - start, 3)
     result = QuestionResult(
         question=question,
         tool=tool_name,
         cache_mode=cache_mode,
-        answer=normalize_answer(answerer.text),
-        reasoning=agent.reasoning,
+        answer=answer,
+        reasoning=reasoning,
         tool_output=tool_output,
-        usage=agent.usage + answerer.usage,
-        latency_s=round(time.perf_counter() - start, 3),
+        usage=usage,
+        latency_s=latency_s,
+        rounds_used=rounds_used,
+        max_rounds=max_rounds,
     )
-    transcript.final(answer=result.answer, usage=result.usage, latency_s=result.latency_s)
-    log.info("[%s] answer=%r tokens(in/out/total)=%d/%d/%d cached=%d cost=$%.6f time=%.2fs",
-             tool_name, result.answer, result.usage.input_tokens, result.usage.output_tokens,
+
+    # One self-contained JSONL record with everything the old text log held.
+    expected_norm = normalize_answer(expected) if expected is not None else None
+    transcript.question_record(record={
+        "id": question_id,
+        "tool": tool_name,
+        "cache_mode": cache_mode,
+        "max_rounds": max_rounds,
+        "rounds_used": rounds_used,
+        "question": question,
+        "expected": expected,
+        "expected_normalized": expected_norm,
+        "answer": answer,
+        "correct": (answer == expected_norm) if expected_norm is not None else None,
+        "prompts": {
+            "agent_system": system_prompt,
+            "answerer_system": answerer.system_prompt,
+        },
+        "rounds": rounds_log,
+        "answerer": {
+            "context": answerer.context,
+            "output": answerer.text,
+            "usage": {
+                "input": answerer.usage.input_tokens,
+                "output": answerer.usage.output_tokens,
+                "total": answerer.usage.total_tokens,
+                "cached": answerer.usage.cached_tokens,
+                "cost_usd": answerer.usage.cost_usd,
+            },
+        },
+        "usage_total": {
+            "input": usage.input_tokens,
+            "output": usage.output_tokens,
+            "total": usage.total_tokens,
+            "cached": usage.cached_tokens,
+            "cost_usd": usage.cost_usd,
+        },
+        "latency_s": latency_s,
+    })
+
+    log.info("[%s] answer=%r rounds=%d/%d tokens(in/out/total)=%d/%d/%d cached=%d cost=$%.6f time=%.2fs",
+             tool_name, result.answer, rounds_used, max_rounds,
+             result.usage.input_tokens, result.usage.output_tokens,
              result.usage.total_tokens, result.usage.cached_tokens, result.usage.cost_usd,
              result.latency_s)
     return result
