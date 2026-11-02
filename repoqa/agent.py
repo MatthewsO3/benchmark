@@ -17,7 +17,7 @@ from . import config
 from .llm import LLMClient, apply_cache_mode
 from .transcript import Transcript
 from .usage import TokenUsage
-from .tools import get_tool
+from .tools import get_tool, get_secondary_tools
 
 log = logging.getLogger("repoqa.agent")
 
@@ -60,6 +60,11 @@ class QuestionResult:
     :param rounds_used: Number of tool-call rounds actually used (early-stop
         aware; may be less than ``max_rounds``).
     :param max_rounds: Maximum tool-call rounds allowed (``n``).
+    :param category: The question's category (metadata for per-category scoring;
+        never shown to the model).
+    :param tool_time_s: Cumulative LOCAL tool execution time across rounds, in
+        seconds. Measures only ``tool.invoke`` (ripgrep/Qdrant/clangd/subprocess)
+        and excludes the LLM API round-trip and any rate-limit backoff.
     """
 
     question: str
@@ -72,12 +77,14 @@ class QuestionResult:
     latency_s: float
     rounds_used: int = 0
     max_rounds: int = 0
+    category: str = "uncategorized"
+    tool_time_s: float = 0.0
 
 
 def answer_question(*, question: str, tool_name: str, client: LLMClient,
                     transcript: Transcript, cache_mode: str = None,
                     max_rounds: int = None, question_id: str = None,
-                    expected: str = None) -> QuestionResult:
+                    expected: str = None, category: str = None) -> QuestionResult:
     """Run the multi-round agent loop for one question and record it.
 
     The agent may call the single tool under test up to ``max_rounds`` (``n``)
@@ -99,11 +106,24 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
     tool = get_tool(tool_name)
     cache_mode = (cache_mode or config.CACHE_MODE).lower()
     max_rounds = max_rounds or config.AGENT_ROUNDS
-    tool_schema = convert_to_openai_tool(tool)
+
+    # The primary (benchmarked) tool, plus any shared secondary tools offered
+    # alongside it (e.g. read_file for grep/lsp/rag; none for shell). Build a
+    # name -> tool map so a round can dispatch to whichever one the model picks.
+    secondary_tools = get_secondary_tools(tool_name)
+    callable_tools = {tool.name: tool}
+    for extra in secondary_tools:
+        callable_tools[extra.name] = extra
+    tool_schemas = [convert_to_openai_tool(t) for t in (tool, *secondary_tools)]
 
     start = time.perf_counter()
 
     # Build the running chat history the agent loop extends each round.
+    # CACHE INVARIANT: the stable system prompt goes FIRST so the provider can
+    # cache it as a shared prefix across all questions; the per-question content
+    # (the question, then each round's tool result) is only ever appended AFTER
+    # it. Never prepend question- or retrieval-specific text ahead of the system
+    # prompt, or the cached prefix breaks and every call pays full price.
     system_prompt = apply_cache_mode(config.SYSTEM_PROMPT, cache_mode)
     messages = [
         {"role": "system", "content": system_prompt},
@@ -114,6 +134,7 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
     reasoning_parts = []
     tool_output_parts = []
     rounds_used = 0
+    tool_time_s = 0.0  # cumulative LOCAL tool execution time (excludes LLM API)
     rounds_log = []  # structured per-round detail for the JSONL record
 
     for round_no in range(1, max_rounds + 1):
@@ -123,7 +144,7 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
                  "forced" if force else "auto", client.model)
         agent = client.call_agent(
             messages=messages,
-            tool_schema=tool_schema,
+            tool_schemas=tool_schemas,
             tool_name=tool_name,
             force=force,
         )
@@ -164,20 +185,38 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
             break
 
         rounds_used = round_no
-        log.info("[%s] round %d tool call args=%s", tool_name, round_no, agent.tool_args)
-        try:
-            round_output = str(tool.invoke(agent.tool_args or {}))
-        except Exception as exc:  # noqa: BLE001
-            # A weak model sometimes emits a malformed tool call (e.g. empty
-            # args missing a required field). Don't crash the whole run: record
-            # the failure as this round's "output" and feed it back so the model
-            # can correct itself on the next round.
-            round_output = f"tool error: invalid arguments {agent.tool_args!r}: {exc}"
-            round_entry["tool_error"] = str(exc)
-            log.warning("[%s] round %d tool call failed (%s)", tool_name, round_no, exc)
+        log.info("[%s] round %d tool call %s args=%s", tool_name, round_no,
+                 agent.tool_name, agent.tool_args)
+        called_tool = callable_tools.get(agent.tool_name)
+        if called_tool is None:
+            # Model named a tool that wasn't offered (shouldn't happen since
+            # only our schemas are passed). Record and feed back so it recovers.
+            round_output = (f"tool error: unknown tool {agent.tool_name!r}; "
+                            f"available: {sorted(callable_tools)}")
+            round_entry["tool_error"] = round_output
+            log.warning("[%s] round %d named unknown tool %r",
+                        tool_name, round_no, agent.tool_name)
         else:
-            log.info("[%s] round %d tool result: %d chars",
-                     tool_name, round_no, len(round_output))
+            tool_start = time.perf_counter()
+            try:
+                round_output = str(called_tool.invoke(agent.tool_args or {}))
+            except Exception as exc:  # noqa: BLE001
+                # A weak model sometimes emits a malformed tool call (e.g. empty
+                # args missing a required field). Don't crash the whole run:
+                # record the failure as this round's "output" and feed it back
+                # so the model can correct itself on the next round.
+                round_output = f"tool error: invalid arguments {agent.tool_args!r}: {exc}"
+                round_entry["tool_error"] = str(exc)
+                log.warning("[%s] round %d tool call failed (%s)", tool_name, round_no, exc)
+            else:
+                log.info("[%s] round %d (%s) tool result: %d chars",
+                         tool_name, round_no, agent.tool_name, len(round_output))
+            # Local tool execution time ONLY (ripgrep/Qdrant/clangd/subprocess).
+            # Deliberately excludes the LLM API round-trip and any rate-limit
+            # backoff, which live in the client calls outside this block.
+            round_tool_time = round(time.perf_counter() - tool_start, 4)
+            round_entry["tool_time_s"] = round_tool_time
+            tool_time_s += round_tool_time
         round_entry["tool_output"] = round_output
         rounds_log.append(round_entry)
         tool_output_parts.append(f"[round {round_no}] {round_output}")
@@ -194,6 +233,10 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
 
     # Final call: tool-free answerer. All accumulated reasoning and tool output
     # is forwarded so every round contributes to the final answer.
+    # CACHE INVARIANT: the stable ANSWERER_SYSTEM_PROMPT is sent as the system
+    # message (the cacheable prefix); all variable content (question, reasoning,
+    # tool/RAG output) is packed into this user-message context that follows it.
+    # Keep the variable content here, after the system prompt — never before.
     context = (
         f"QUESTION:\n{question}\n\n"
         f"AGENT REASONING:\n{reasoning or '(none)'}\n\n"
@@ -221,12 +264,15 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
         latency_s=latency_s,
         rounds_used=rounds_used,
         max_rounds=max_rounds,
+        category=category or "uncategorized",
+        tool_time_s=round(tool_time_s, 4),
     )
 
     # One self-contained JSONL record with everything the old text log held.
     expected_norm = normalize_answer(expected) if expected is not None else None
     transcript.question_record(record={
         "id": question_id,
+        "category": category or "uncategorized",
         "tool": tool_name,
         "cache_mode": cache_mode,
         "max_rounds": max_rounds,
@@ -260,6 +306,7 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
             "cost_usd": usage.cost_usd,
         },
         "latency_s": latency_s,
+        "tool_time_s": round(tool_time_s, 4),
     })
 
     log.info("[%s] answer=%r rounds=%d/%d tokens(in/out/total)=%d/%d/%d cached=%d cost=$%.6f time=%.2fs",

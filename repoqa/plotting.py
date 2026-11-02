@@ -75,7 +75,7 @@ def load_summary(log_path: str):
 
 
 def plot(summary: dict, log_path: str, *, cache_mode: str = None) -> str:
-    """Render and save the three-panel comparison chart.
+    """Render and save the comparison chart (accuracy, tokens, latency, tool time).
 
     :param summary: Per-tool summary dict (from :func:`load_summary`).
     :param log_path: Path to the source log (used for the title and output name).
@@ -86,8 +86,9 @@ def plot(summary: dict, log_path: str, *, cache_mode: str = None) -> str:
     accuracy = [summary[t]["accuracy"] * 100 for t in tools]
     mean_tokens = [summary[t]["mean_total_tokens"] for t in tools]
     mean_time = [summary[t]["mean_time_s"] for t in tools]
+    mean_tool_time = [summary[t].get("mean_tool_time_s", 0) for t in tools]
 
-    fig, axes = plt.subplots(1, 3, figsize=(13, 4.5))
+    fig, axes = plt.subplots(1, 4, figsize=(17, 4.5))
     title = f"Tool benchmark — {os.path.basename(log_path)}"
     if cache_mode:
         title += f"  (cache={cache_mode})"
@@ -97,6 +98,7 @@ def plot(summary: dict, log_path: str, *, cache_mode: str = None) -> str:
         (axes[0], accuracy, "Accuracy (%)", "%.0f%%", (0, 100)),
         (axes[1], mean_tokens, "Mean total tokens / question", "%.0f", None),
         (axes[2], mean_time, "Mean latency (s) / question", "%.1fs", None),
+        (axes[3], mean_tool_time, "Mean tool time (s) / question", "%.3fs", None),
     ]
     for axis, values, label, fmt, ylim in panels:
         bars = axis.bar(tools, values, color=_COLORS[:len(tools)])
@@ -141,10 +143,13 @@ def _marker(i: int) -> str:
 def plot_sweep(sweep_dir: str) -> str:
     """Plot how each metric varies with the round budget ``n`` across a sweep.
 
-    Reads every ``n{k}.log`` in ``sweep_dir`` (written by ``run_sweep.py``),
-    then draws one figure with a panel per metric (accuracy, mean total tokens,
-    mean latency, mean cost, mean rounds used); within each panel there is one
-    line per tool plotted against ``n``.
+    Reads every ``n{k}.jsonl`` in ``sweep_dir`` (written by ``run_sweep.py``),
+    then draws one figure with a panel per metric; within each panel there is
+    one line per tool plotted against ``n``. Accuracy is broken out into an
+    **overall** panel plus **one panel per question category** found in the run
+    (e.g. ``local_fact``, ``complex_reasoning``, ``cross_subsystem``), so you can
+    see how each question type responds to more rounds; the remaining panels are
+    mean total tokens, mean latency, mean tool time, mean cost, and mean rounds used.
 
     :param sweep_dir: Directory holding the per-n logs and ``sweep.json``.
     :return: Path to the saved comparison PNG.
@@ -167,13 +172,45 @@ def plot_sweep(sweep_dir: str) -> str:
     ns = sorted(per_n)
     tools = list(next(iter(per_n.values())).keys())
 
-    # (metric key, panel title, scale factor, value format)
-    metrics = [
-        ("accuracy", "Accuracy (%)", 100.0, "%.0f"),
-        ("mean_total_tokens", "Mean total tokens / q", 1.0, "%.0f"),
-        ("mean_time_s", "Mean latency (s) / q", 1.0, "%.1f"),
-        ("mean_cost_usd", "Mean cost ($) / q", 1.0, "%.5f"),
-        ("mean_rounds", "Mean rounds used", 1.0, "%.2f"),
+    # Discover which question categories appear in the run (from any tool's
+    # by_category block). Lets the chart adapt to whatever the question set
+    # used; an un-categorized run simply yields no extra accuracy panels.
+    present_categories = []
+    for summary in per_n.values():
+        for tool_summary in summary.values():
+            for cat in (tool_summary.get("by_category") or {}):
+                if cat not in present_categories:
+                    present_categories.append(cat)
+    # Stable, readable order; drop the "uncategorized" bucket from the
+    # per-category panels (it is already covered by the overall panel).
+    present_categories = [c for c in sorted(present_categories) if c != "uncategorized"]
+
+    def _value(tool_summary, key, category):
+        """Pull a metric from a tool's summary (flat key or category accuracy).
+
+        :param tool_summary: One tool's summary dict for a given ``n``.
+        :param key: The flat metric key, or ``"accuracy"`` when ``category`` set.
+        :param category: A category name to read per-category accuracy for, or
+            ``None`` for the flat/overall metric.
+        :return: The numeric value (0 if missing).
+        """
+        if category is not None:
+            entry = (tool_summary.get("by_category") or {}).get(category) or {}
+            return entry.get("accuracy", 0)
+        return tool_summary.get(key, 0)
+
+    # (metric key, panel title, scale factor, value format, category-or-None).
+    # Accuracy is split into one OVERALL panel plus one panel per category so
+    # you can see how each question type responds to the round budget n.
+    metrics = [("accuracy", "Accuracy — overall (%)", 100.0, "%.0f", None)]
+    for cat in present_categories:
+        metrics.append(("accuracy", f"Accuracy — {cat} (%)", 100.0, "%.0f", cat))
+    metrics += [
+        ("mean_total_tokens", "Mean total tokens / q", 1.0, "%.0f", None),
+        ("mean_time_s", "Mean latency (s) / q", 1.0, "%.1f", None),
+        ("mean_tool_time_s", "Mean tool time (s) / q", 1.0, "%.3f", None),
+        ("mean_cost_usd", "Mean cost ($) / q", 1.0, "%.5f", None),
+        ("mean_rounds", "Mean rounds used", 1.0, "%.2f", None),
     ]
 
     cols = 3
@@ -186,9 +223,9 @@ def plot_sweep(sweep_dir: str) -> str:
         title += f"  (cache={cache_mode})"
     fig.suptitle(title, fontsize=14)
 
-    for axis, (key, label, scale, fmt) in zip(axes, metrics):
+    for axis, (key, label, scale, fmt, category) in zip(axes, metrics):
         for ti, tool in enumerate(tools):
-            ys = [per_n[n].get(tool, {}).get(key, 0) * scale for n in ns]
+            ys = [_value(per_n[n].get(tool, {}), key, category) * scale for n in ns]
             axis.plot(ns, ys, marker=_marker(ti), color=_COLORS[ti % len(_COLORS)],
                       label=tool, linewidth=1.8)
             for x, y in zip(ns, ys):

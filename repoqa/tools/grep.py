@@ -21,7 +21,10 @@ def _ripgrep(pattern: str, repo: str):
     :return: Matching lines (``file:line:text``), an error string, or ``None``
         if ripgrep is not installed.
     """
-    command = ["rg", "-n", "-i", "--no-heading", "-g", "*.py"]
+    command = ["rg", "-n", "-i", "--no-heading"]
+    # Restrict to in-scope source files (``*.c``/``*.h`` for the kernel, etc.).
+    for glob in config.SOURCE_GLOBS:
+        command += ["-g", glob]
     for excluded in EXCLUDE_DIRS:
         command += ["-g", f"!**/{excluded}/**"]
     command += [pattern, repo]

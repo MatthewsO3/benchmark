@@ -130,7 +130,7 @@ class LLMClient:
                             attempt + 1, self.max_retries, delay)
                 time.sleep(delay)
 
-    def _request_agent(self, messages, tool_schema, tool_choice):
+    def _request_agent(self, messages, tool_schemas, tool_choice):
         """Make one raw agent completion and validate the response shape.
 
         OpenRouter surfaces provider errors (incl. rate limits) in the response
@@ -138,6 +138,7 @@ class LLMClient:
         on ``response.choices[0]``. Detect that and raise so :meth:`_retry` can
         back off on rate limits or fail loudly otherwise.
 
+        :param tool_schemas: List of OpenAI-format tool schemas to offer.
         :raises RuntimeError: If the provider returned no choices.
         """
         response = self._openai.chat.completions.create(
@@ -145,7 +146,7 @@ class LLMClient:
             temperature=self.temperature,
             max_tokens=config.AGENT_MAX_TOKENS,
             messages=messages,
-            tools=[tool_schema],
+            tools=list(tool_schemas),
             tool_choice=tool_choice,
             extra_body={"reasoning": {"enabled": True}, "usage": {"include": True}},
         )
@@ -154,27 +155,29 @@ class LLMClient:
             raise RuntimeError(f"provider returned no choices: {err}")
         return response
 
-    def call_agent(self, *, messages, tool_schema, tool_name, force):
+    def call_agent(self, *, messages, tool_schemas, tool_name, force):
         """Run one agent turn over ``messages`` and capture the reasoning.
 
         One LLM call in the tool-call loop. On the first round ``force`` is
-        ``True`` so the model must call ``tool_name``; on later rounds it is
-        ``False`` (``tool_choice="auto"``) so the model may call the same tool
-        again or stop (return no tool call). Only ``tool_schema`` is offered, so
-        ``auto`` can never pick a different tool.
+        ``True`` so the model must call ``tool_name`` (the primary search tool);
+        on later rounds it is ``False`` (``tool_choice="auto"``) so the model
+        may call any offered tool again, call the shared read tool, or stop
+        (return no tool call). Only ``tool_schemas`` are offered, so ``auto``
+        can never pick a tool outside the intended set.
 
         :param messages: The running chat history (list of message dicts). Not
             mutated; the caller appends :attr:`AgentCall.assistant_message` and
             any tool result itself.
-        :param tool_schema: OpenAI-format JSON schema for the single tool.
-        :param tool_name: Name of the tool (forced on round 1).
-        :param force: Whether to force the tool call this round.
+        :param tool_schemas: List of OpenAI-format JSON schemas (the primary
+            tool, plus any shared secondary tools such as ``read_file``).
+        :param tool_name: Name of the primary tool (forced on round 1).
+        :param force: Whether to force the primary tool call this round.
         :return: An :class:`AgentCall`.
         """
         tool_choice = (
             {"type": "function", "function": {"name": tool_name}} if force else "auto"
         )
-        response = self._retry(lambda: self._request_agent(messages, tool_schema, tool_choice))
+        response = self._retry(lambda: self._request_agent(messages, tool_schemas, tool_choice))
 
         message = response.choices[0].message
         called_name, called_args, call_id = None, None, None

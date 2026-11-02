@@ -4,29 +4,48 @@ from typing import Iterator
 from urllib.parse import urlparse, unquote
 from urllib.request import url2pathname
 
-#: Directories skipped when scanning the target repo (caches, vendored code,
-#: build artefacts) so results stay focused on first-party source.
+from .. import config
+
+#: Directories skipped when scanning the target repo (VCS metadata, caches,
+#: vendored code, build artefacts) so results stay focused on first-party
+#: source. Covers both Python/JS projects and large C repos like the Linux
+#: kernel (whose build output and git metadata we never want to index).
 EXCLUDE_DIRS = {
-    ".venv", "venv", "env", ".git", "__pycache__", "node_modules",
+    # VCS / editors / generic caches
+    ".git", ".svn", ".hg", ".idea", ".vscode", ".cache", "data",
+    # python / js tooling
+    ".venv", "venv", "env", "__pycache__", "node_modules",
     ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist", "build",
-    ".idea", ".vscode", "site-packages", ".cache", "data",
+    "site-packages",
+    # kernel / C build output (harmless if absent)
+    ".tmp_versions", "include/generated", "include/config",
 }
 
-#: Only Python source files are searched (this is a Python-repo benchmark).
-INCLUDE_EXT = ".py"
+
+def _matches_source(name: str) -> bool:
+    """Return whether a filename is an in-scope source file.
+
+    :param name: The bare filename.
+    :return: ``True`` if it ends with one of :data:`config.SOURCE_EXTENSIONS`.
+    """
+    return name.endswith(config.SOURCE_EXTENSIONS)
 
 
 def walk_repo(repo: str) -> Iterator[str]:
     """Yield source file paths under ``repo``, skipping :data:`EXCLUDE_DIRS`.
 
+    "Source file" is defined by :data:`config.SOURCE_EXTENSIONS` (``.c``/``.h``
+    for the kernel by default, ``.py`` for a Python target), so this walk is
+    language-agnostic and controlled by configuration.
+
     :param repo: Root directory to walk.
-    :return: Iterator over ``.py`` file paths.
+    :return: Iterator over in-scope source file paths.
     """
     for root, dirs, files in os.walk(repo):
         # Prune excluded directories in place so os.walk won't descend into them.
         dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
         for name in files:
-            if name.endswith(INCLUDE_EXT):
+            if _matches_source(name):
                 yield os.path.join(root, name)
 
 

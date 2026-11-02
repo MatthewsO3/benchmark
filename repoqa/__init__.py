@@ -9,7 +9,7 @@ import logging
 #: Third-party loggers whose per-request chatter is silenced to WARNING.
 _NOISY_LOGGERS = (
     "httpx", "httpx2", "openai", "httpcore", "httpcore2",
-    "huggingface_hub", "sentence_transformers", "faiss",
+    "huggingface_hub", "sentence_transformers", "qdrant_client",
     "transformers", "urllib3", "filelock",
 )
 

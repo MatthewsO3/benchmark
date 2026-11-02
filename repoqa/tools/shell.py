@@ -28,15 +28,52 @@ _MAX_OUTPUT_CHARS = 4000
 #: Hard wall-clock limit for a single command.
 _TIMEOUT_S = 30
 
-#: Read-only programs the model may invoke, keyed loosely by intent. Anything
-#: not in this set is rejected before execution.
+#: Read-only programs the model may invoke (the first token). The sandbox's
+#: safety does NOT rest on this list being short: it rests on (a) running with
+#: ``shell=False`` and rejecting bare operator tokens, so nothing can pipe,
+#: redirect, chain, or substitute — hence no command can *write* or combine
+#: into a destructive one — and (b) confining every path argument to
+#: ``TARGET_REPO`` (see ``_check_paths_confined``), so nothing outside the repo
+#: can be read. Given those two invariants, the list only needs to stay
+#: *read-only*: every program here merely inspects/reads files or metadata and
+#: never mutates state. It was previously kept deliberately tiny for running on
+#: a personal machine; on a server the read-only set below is a fair, more
+#: capable surface for the shell condition. Anything not listed is rejected.
 _WHITELIST = {
-    # cross-platform / unix
-    "rg", "grep", "find", "ls", "cat", "head", "tail", "wc", "sort",
-    "uniq", "tree", "stat", "file", "basename", "dirname", "echo",
-    # windows native
+    # --- search / content (read-only) ---
+    "rg", "grep", "egrep", "fgrep", "cat", "head", "tail", "less", "more",
+    "nl", "cut", "tr", "fold", "rev", "column", "strings", "xxd", "od", "hexdump",
+    # --- listing / navigation / metadata (read-only) ---
+    "ls", "find", "tree", "stat", "file", "wc", "du", "df", "readlink",
+    "realpath", "basename", "dirname", "pwd", "echo",
+    # --- text processing (read-only; no in-place editing) ---
+    "sort", "uniq", "comm", "diff", "awk", "gawk", "sed",
+    # --- structured / source inspection (read-only) ---
+    "jq", "python3", "python",
+    # --- windows native (read-only) ---
     "dir", "findstr", "type", "where", "fc",
 }
+
+#: Programs on the whitelist that can nonetheless *write* or run arbitrary code
+#: when given certain flags, so they are allowed only in a restricted form.
+#: ``sed``/``awk`` can edit in place or shell out; ``python`` can do anything.
+#: Rather than ban them (they are genuinely useful read-only), we reject the
+#: dangerous flags and, for interpreters, require an explicit read-only form.
+#: Keys map a program to the set of argument tokens that get it rejected.
+_FORBIDDEN_FLAGS = {
+    "sed": {"-i", "--in-place", "-s", "-f", "--file"},
+    "gawk": {"-i", "--include", "-f", "--file", "--load", "-l"},
+    "awk": {"-f", "--file"},
+    "find": {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint",
+             "-fprint0", "-fprintf", "-fls"},
+}
+
+#: Interpreters that can execute arbitrary code; allowed only to print a file's
+#: contents or version, never to ``-c``/run a script (which could write/escape).
+_INTERPRETERS = {"python", "python3"}
+#: Flags an interpreter may use (everything else, incl. ``-c`` and script paths
+#: without an explicit reader, is rejected).
+_INTERPRETER_ALLOWED_FLAGS = {"--version", "-V"}
 
 #: Standalone shell-operator tokens that would chain/pipe/redirect commands.
 #: Checked *after* parsing, per token: an operator inside a quoted argument
@@ -134,6 +171,45 @@ def _reject(reason: str) -> str:
     return f"shell rejected: {reason}"
 
 
+def _check_flags_safe(program: str, argv: list) -> str:
+    """Reject commands whose flags would let a read-only program write or escape.
+
+    Several whitelisted programs are read-only *only in their normal form*:
+    ``sed -i`` edits in place, ``find -exec``/``-delete`` run/remove files,
+    ``awk -f``/``gawk -i`` load external programs, and the Python interpreters
+    can do anything via ``-c``/a script. This keeps those programs available for
+    their legitimate read-only uses while blocking the dangerous invocations.
+
+    :param program: The normalized program name (``argv[0]`` basename, lowered).
+    :param argv: The full parsed argument vector.
+    :return: Empty string if the flags are safe, else a rejection message.
+    """
+    args = argv[1:]
+
+    # Interpreters: allow only an explicit read-only form (print a version).
+    # Anything that could execute code (``-c``, ``-m``, a script path, stdin
+    # ``-``) is refused — use ``cat``/``read_file`` to see source instead.
+    if program in _INTERPRETERS:
+        for token in args:
+            if token.startswith("-") and token not in _INTERPRETER_ALLOWED_FLAGS:
+                return _reject(f"{program}: only {sorted(_INTERPRETER_ALLOWED_FLAGS)} "
+                               "are allowed (no code execution via the interpreter)")
+            if not token.startswith("-"):
+                return _reject(f"{program}: running scripts/args is not allowed; "
+                               "use cat/head/grep to inspect files")
+        return ""
+
+    forbidden = _FORBIDDEN_FLAGS.get(program)
+    if forbidden:
+        for token in args:
+            # Compare the flag name before any '=' (e.g. --file=foo).
+            flag = token.split("=", 1)[0]
+            if flag in forbidden:
+                return _reject(f"{program}: flag {flag!r} is not allowed "
+                               "(it can write files or execute code)")
+    return ""
+
+
 def _run(argv: list, *, use_cmd: bool) -> str:
     """Execute ``argv`` without a shell and return captured output.
 
@@ -202,6 +278,10 @@ def run_command(command: str) -> str:
     if program not in _WHITELIST:
         return _reject(f"program {program!r} is not in the read-only whitelist")
 
+    flag_error = _check_flags_safe(program, argv)
+    if flag_error:
+        return flag_error
+
     confinement_error = _check_paths_confined(argv)
     if confinement_error:
         return confinement_error
@@ -212,8 +292,10 @@ def run_command(command: str) -> str:
 
 @tool
 def shell_tool(command: str) -> str:
-    """Run ONE read-only shell COMMAND to inspect the repo (e.g. "rg -n foo .",
-    "ls src", "cat path/to/file.py"). Sandboxed: only read-only programs are
-    allowed, no pipes/redirects/chaining, every path argument must stay inside
-    the repo directory (absolute paths and '..' traversal are rejected)."""
+    """Run ONE read-only shell COMMAND to inspect the repo. Examples:
+    "rg -n foo .", "ls -R kernel", "cat mm/slub.c", "find . -name '*.c'",
+    "head -50 fs/read_write.c", "wc -l include/linux/list.h", "grep -rn TODO .".
+    Sandboxed: only read-only programs are allowed (no writing/editing/execution),
+    no pipes/redirects/chaining/substitution, and every path argument must stay
+    inside the repo directory (absolute paths and '..' traversal are rejected)."""
     return run_command(command)
