@@ -65,28 +65,64 @@ def uri_to_path(uri: str) -> str:
     return url2pathname(unquote(parsed.path))
 
 
-def chunk_by_lines(text: str, *, max_chars: int = 800, overlap_lines: int = 3) -> list:
+#: Default chunking parameters, shared by :func:`chunk_by_lines` and
+#: :func:`iter_chunks_with_lines`. Sourced from :mod:`config` so there is one
+#: overridable definition. The RAG cache fingerprint folds these in, so
+#: changing them (via ``CHUNK_MAX_CHARS`` / ``CHUNK_OVERLAP_LINES`` in the env)
+#: invalidates a stale index instead of silently reusing chunks cut at a
+#: different size.
+CHUNK_MAX_CHARS = config.CHUNK_MAX_CHARS
+CHUNK_OVERLAP_LINES = config.CHUNK_OVERLAP_LINES
+
+
+def iter_chunks_with_lines(text, *, max_chars=CHUNK_MAX_CHARS,
+                           overlap_lines=CHUNK_OVERLAP_LINES):
+    """Split ``text`` into line-boundary chunks, yielding each with its line span.
+
+    Same accumulation rule as :func:`chunk_by_lines` (whole lines up to roughly
+    ``max_chars``, a single over-long line standing alone, ``overlap_lines``
+    trailing lines carried into the next chunk), but implemented as a generator
+    that also reports where each chunk sits in the file. This lets a caller
+    stream chunks without materializing them all, and show line numbers in
+    output.
+
+    :param text: The text to split.
+    :param max_chars: Approximate maximum characters per chunk.
+    :param overlap_lines: Number of trailing lines repeated in the next chunk.
+    :yield: ``(chunk_text, start_line, end_line)`` with 1-based inclusive lines.
+    """
+    lines = text.splitlines(keepends=True)
+    current = []          # (line_number, line_text) pending in this chunk
+    current_len = 0
+    for lineno, line in enumerate(lines, 1):
+        if current and current_len + len(line) > max_chars:
+            chunk = "".join(part for _, part in current)
+            yield chunk, current[0][0], current[-1][0]
+            current = current[-overlap_lines:] if overlap_lines else []
+            current_len = sum(len(part) for _, part in current)
+        current.append((lineno, line))
+        current_len += len(line)
+    if current:
+        chunk = "".join(part for _, part in current)
+        if chunk.strip():
+            yield chunk, current[0][0], current[-1][0]
+
+
+def chunk_by_lines(text: str, *, max_chars: int = CHUNK_MAX_CHARS,
+                   overlap_lines: int = CHUNK_OVERLAP_LINES) -> list:
     """Split ``text`` into chunks that respect line boundaries.
 
     Whole lines are accumulated up to roughly ``max_chars`` per chunk (a single
     over-long line becomes its own chunk). The last ``overlap_lines`` lines are
     carried into the next chunk so context spanning a boundary is not lost.
 
+    Thin wrapper over :func:`iter_chunks_with_lines` that drops the line spans.
+
     :param text: The text to split.
     :param max_chars: Approximate maximum characters per chunk.
     :param overlap_lines: Number of trailing lines repeated in the next chunk.
     :return: List of chunk strings.
     """
-    lines = text.splitlines(keepends=True)
-    chunks = []
-    current, current_len = [], 0
-    for line in lines:
-        if current and current_len + len(line) > max_chars:
-            chunks.append("".join(current))
-            current = current[-overlap_lines:] if overlap_lines else []
-            current_len = sum(len(part) for part in current)
-        current.append(line)
-        current_len += len(line)
-    if current and "".join(current).strip():
-        chunks.append("".join(current))
-    return chunks
+    return [chunk for chunk, _start, _end in
+            iter_chunks_with_lines(text, max_chars=max_chars,
+                                   overlap_lines=overlap_lines)]

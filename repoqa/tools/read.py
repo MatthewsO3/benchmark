@@ -20,6 +20,7 @@ import os
 from langchain_core.tools import tool
 
 from .. import config
+from ..ladder import in_scope, active_scope
 
 #: Maximum number of lines returned by a single read (per teammate request).
 _MAX_LINES = 50
@@ -63,6 +64,12 @@ def read_path(path: str, start_line: int = 1, end_line: int = None) -> str:
 
     expanded = os.path.expanduser(path)
     abs_path = expanded if os.path.isabs(expanded) else os.path.join(repo, expanded)
+    # Ladder containment (decision ii): a file outside the active rung scope is
+    # treated exactly as if it did not exist, so a reduced rung is
+    # indistinguishable from a kernel that only contained the scoped subsystems.
+    # No message reveals that a larger tree is present.
+    if active_scope() is not None and not in_scope(abs_path):
+        return f"read error: no such file {path!r}"
     if not os.path.isfile(abs_path):
         return f"read error: no such file {path!r}"
 

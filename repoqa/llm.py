@@ -25,6 +25,47 @@ log = logging.getLogger("repoqa.llm")
 #: Substrings that mark a rate-limit error worth retrying.
 _RATE_LIMIT_MARKERS = ("429", "rate", "temporarily")
 
+#: Regex for an inline ``<think>...</think>`` reasoning block some models emit
+#: in the message content instead of a dedicated field.
+import re as _re  # noqa: E402
+
+_THINK_BLOCK_RE = _re.compile(r"<think>(.*?)</think>", _re.DOTALL | _re.IGNORECASE)
+
+
+def _extract_reasoning(message) -> str:
+    """Pull the model's reasoning trace from wherever the backend put it.
+
+    Different OpenAI-compatible backends expose chain-of-thought differently:
+
+    * OpenRouter uses a top-level ``reasoning`` field;
+    * vLLM (e.g. the self-hosted Qwen3 server) uses ``reasoning_content`` and
+      also mirrors it under ``provider_specific_fields["reasoning"]``;
+    * some models emit no field and instead wrap reasoning in a ``<think>...
+      </think>`` block inside ``content``.
+
+    This checks each location in that order and returns the first non-empty
+    trace, so the transcript captures reasoning regardless of backend rather
+    than silently recording ``(none)``.
+
+    :param message: The raw response message object.
+    :return: The reasoning text (stripped), or ``""`` if none is present.
+    """
+    # 1) Dedicated fields (OpenRouter 'reasoning', vLLM 'reasoning_content').
+    for attr in ("reasoning", "reasoning_content"):
+        value = getattr(message, attr, None)
+        if value:
+            return str(value).strip()
+    # 2) provider_specific_fields.reasoning (vLLM mirrors it here too).
+    psf = getattr(message, "provider_specific_fields", None) or {}
+    if isinstance(psf, dict) and psf.get("reasoning"):
+        return str(psf["reasoning"]).strip()
+    # 3) Inline <think>...</think> block in the content, if any.
+    content = getattr(message, "content", None) or ""
+    match = _THINK_BLOCK_RE.search(content)
+    if match:
+        return match.group(1).strip()
+    return ""
+
 
 def apply_cache_mode(system_prompt: str, cache_mode: str) -> str:
     """Return the system prompt, optionally nonce-prefixed to defeat caching.
@@ -97,7 +138,7 @@ class LLMClient:
         # Raw SDK client for the agent call (reads the `reasoning` field).
         # timeout so a hung round surfaces as an error instead of blocking.
         self._openai = OpenAI(base_url=config.LLM_BASE_URL, api_key=config.LLM_API_KEY,
-                              timeout=120.0)
+                              timeout=config.LLM_TIMEOUT_S)
         # langchain client for the answerer call (we handle retries ourselves).
         self._answerer = ChatOpenAI(
             model=config.LLM_MODEL,
@@ -105,7 +146,7 @@ class LLMClient:
             base_url=config.LLM_BASE_URL,
             api_key=config.LLM_API_KEY,
             max_retries=0,
-            timeout=120.0,
+            timeout=config.LLM_TIMEOUT_S,
             max_tokens=config.ANSWERER_MAX_TOKENS,
         )
 
@@ -203,7 +244,7 @@ class LLMClient:
                 },
             }]
         return AgentCall(
-            reasoning=(getattr(message, "reasoning", None) or "").strip(),
+            reasoning=_extract_reasoning(message),
             tool_name=called_name,
             tool_args=called_args,
             tool_call_id=call_id,

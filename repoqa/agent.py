@@ -9,7 +9,7 @@ to the tool rather than to multi-step reasoning.
 import re
 import time
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from langchain_core.utils.function_calling import convert_to_openai_tool
 
@@ -57,14 +57,25 @@ class QuestionResult:
     :param tool_output: The raw tool output.
     :param usage: Combined token/cost accounting for both calls.
     :param latency_s: Wall-clock time for both calls, in seconds.
-    :param rounds_used: Number of tool-call rounds actually used (early-stop
-        aware; may be less than ``max_rounds``).
-    :param max_rounds: Maximum tool-call rounds allowed (``n``).
+    :param rounds_used: Number of tool-call rounds actually used (the agent
+        stops on its own when it has enough evidence; the open loop is only
+        bounded by ``max_rounds`` as a safety cap).
+    :param max_rounds: Safety cap on tool-call rounds for the open loop.
     :param category: The question's category (metadata for per-category scoring;
         never shown to the model).
     :param tool_time_s: Cumulative LOCAL tool execution time across rounds, in
         seconds. Measures only ``tool.invoke`` (ripgrep/Qdrant/clangd/subprocess)
         and excludes the LLM API round-trip and any rate-limit backoff.
+    :param tool_calls: Total number of tool calls the agent actually made across
+        the open loop (task 3: now that the loop is open, this is a first-class
+        metric, not a constant).
+    :param tool_call_counts: Per-tool count of calls (e.g. how many primary-tool
+        vs ``read_file`` calls), keyed by tool name.
+    :param tool_call_time_s: Per-tool cumulative LOCAL execution time, keyed by
+        tool name (task 4: tool-use time for every tool).
+    :param tool_call_tokens: Per-tool cumulative token usage attributed to the
+        agent turn that issued each call, keyed by tool name (task 3).
+    :param reasoning_tokens: Total hidden reasoning tokens across all calls.
     """
 
     question: str
@@ -79,33 +90,42 @@ class QuestionResult:
     max_rounds: int = 0
     category: str = "uncategorized"
     tool_time_s: float = 0.0
+    tool_calls: int = 0
+    tool_call_counts: dict = field(default_factory=dict)
+    tool_call_time_s: dict = field(default_factory=dict)
+    tool_call_tokens: dict = field(default_factory=dict)
+    reasoning_tokens: int = 0
 
 
 def answer_question(*, question: str, tool_name: str, client: LLMClient,
                     transcript: Transcript, cache_mode: str = None,
                     max_rounds: int = None, question_id: str = None,
                     expected: str = None, category: str = None) -> QuestionResult:
-    """Run the multi-round agent loop for one question and record it.
+    """Run the OPEN agent loop for one question and record it.
 
-    The agent may call the single tool under test up to ``max_rounds`` (``n``)
-    times. Round 1 forces the tool so one is always exercised; rounds 2..n use
-    ``tool_choice="auto"`` so the model may call the same tool again or stop
-    early when it decides it has enough evidence. The number of rounds actually
-    used is recorded for metrics. A final tool-free answerer call collapses the
-    question + accumulated reasoning + tool outputs into one ``yes``/``no`` word.
+    The loop is open-ended: each round the agent may call the single tool under
+    test (or the shared ``read_file``), and it keeps going until it decides it
+    has enough evidence and stops emitting tool calls — at which point the final
+    tool-free answerer/verifier call collapses the question + accumulated
+    reasoning + tool outputs into one ``yes``/``no`` word. No round is forced;
+    the agent is free from the first turn. ``max_rounds`` is only a SAFETY CAP
+    that bounds a runaway/looping model, not a target.
+
+    Per-tool-call metrics are recorded now that the loop is open: the number of
+    tool calls, and per-tool counts, local execution time, and token usage.
 
     :param question: The question to answer.
     :param tool_name: Name of the single tool to use (``grep_tool`` etc.).
     :param client: The :class:`~repoqa.llm.LLMClient` to use.
     :param transcript: The :class:`~repoqa.transcript.Transcript` to log to.
     :param cache_mode: ``"on"``/``"off"``; defaults to :data:`config.CACHE_MODE`.
-    :param max_rounds: Max tool-call rounds (``n``); defaults to
-        :data:`config.AGENT_ROUNDS`.
+    :param max_rounds: Safety cap on tool-call rounds; defaults to
+        :data:`config.AGENT_MAX_ROUNDS`.
     :return: The :class:`QuestionResult`.
     """
     tool = get_tool(tool_name)
     cache_mode = (cache_mode or config.CACHE_MODE).lower()
-    max_rounds = max_rounds or config.AGENT_ROUNDS
+    max_rounds = max_rounds or config.AGENT_MAX_ROUNDS
 
     # The primary (benchmarked) tool, plus any shared secondary tools offered
     # alongside it (e.g. read_file for grep/lsp/rag; none for shell). Build a
@@ -136,17 +156,23 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
     rounds_used = 0
     tool_time_s = 0.0  # cumulative LOCAL tool execution time (excludes LLM API)
     rounds_log = []  # structured per-round detail for the JSONL record
+    tool_calls = 0  # total tool calls across the open loop (task 3)
+    tool_call_counts = {}      # per-tool call count (task 3)
+    tool_call_time_s = {}      # per-tool cumulative local time (task 4)
+    tool_call_tokens = {}      # per-tool cumulative TokenUsage (task 3)
+    hit_cap = False
 
     for round_no in range(1, max_rounds + 1):
-        force = round_no == 1  # round 1 forces the tool; later rounds are auto.
-        log.info("[%s] LLM call (agent round %d/%d, %s) model=%s",
-                 tool_name, round_no, max_rounds,
-                 "forced" if force else "auto", client.model)
+        # OPEN loop: no round is forced. The agent chooses whether to call a
+        # tool (tool_choice="auto") every round and stops on its own when done;
+        # max_rounds is only a safety cap.
+        log.info("[%s] LLM call (agent round %d, cap %d, auto) model=%s",
+                 tool_name, round_no, max_rounds, client.model)
         agent = client.call_agent(
             messages=messages,
             tool_schemas=tool_schemas,
             tool_name=tool_name,
-            force=force,
+            force=False,
         )
         usage = usage + agent.usage
         if agent.reasoning:
@@ -154,37 +180,36 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
 
         round_entry = {
             "round": round_no,
-            "forced": force,
+            "forced": False,
             "reasoning": agent.reasoning,
             "tool_name": agent.tool_name,
             "tool_args": agent.tool_args,
             "tool_output": None,
-            "usage": {
-                "input": agent.usage.input_tokens,
-                "output": agent.usage.output_tokens,
-                "total": agent.usage.total_tokens,
-                "cached": agent.usage.cached_tokens,
-                "cost_usd": agent.usage.cost_usd,
-            },
+            "usage": agent.usage.as_dict(),
         }
 
         # Keep the assistant turn in history for the next round.
         messages.append(agent.assistant_message)
 
         if not agent.tool_name:
-            # Model chose to stop (only possible on auto rounds). Early exit.
+            # Agent decided it is done (no tool call) -> exit the open loop and
+            # proceed to the final answerer/verifier call.
             round_entry["stopped_early"] = True
             rounds_log.append(round_entry)
-            log.info("[%s] agent stopped after %d round(s) (no tool call)",
-                     tool_name, round_no - 1 if round_no > 1 else round_no)
-            if round_no == 1:
-                log.warning("[%s] model did not call the tool on forced round", tool_name)
-            else:
-                # Drop the trailing assistant turn that carried no tool call.
-                messages.pop()
+            log.info("[%s] agent finished after %d tool-call round(s) (said done)",
+                     tool_name, rounds_used)
+            # Drop the trailing assistant turn that carried no tool call.
+            messages.pop()
             break
 
         rounds_used = round_no
+        tool_calls += 1
+        called_name = agent.tool_name
+        tool_call_counts[called_name] = tool_call_counts.get(called_name, 0) + 1
+        # Attribute this agent turn's token usage to the tool it called (task 3).
+        tool_call_tokens[called_name] = (
+            tool_call_tokens.get(called_name, TokenUsage()) + agent.usage
+        )
         log.info("[%s] round %d tool call %s args=%s", tool_name, round_no,
                  agent.tool_name, agent.tool_args)
         called_tool = callable_tools.get(agent.tool_name)
@@ -217,6 +242,9 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
             round_tool_time = round(time.perf_counter() - tool_start, 4)
             round_entry["tool_time_s"] = round_tool_time
             tool_time_s += round_tool_time
+            # Per-tool cumulative local time (task 4).
+            tool_call_time_s[called_name] = round(
+                tool_call_time_s.get(called_name, 0.0) + round_tool_time, 4)
         round_entry["tool_output"] = round_output
         rounds_log.append(round_entry)
         tool_output_parts.append(f"[round {round_no}] {round_output}")
@@ -227,6 +255,11 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
             "tool_call_id": agent.tool_call_id,
             "content": round_output,
         })
+    else:
+        # Loop exhausted the safety cap without the agent saying "done".
+        hit_cap = True
+        log.warning("[%s] hit safety cap of %d rounds without the agent "
+                    "stopping; proceeding to answerer", tool_name, max_rounds)
 
     reasoning = "\n\n".join(reasoning_parts)
     tool_output = "\n\n".join(tool_output_parts)
@@ -266,6 +299,11 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
         max_rounds=max_rounds,
         category=category or "uncategorized",
         tool_time_s=round(tool_time_s, 4),
+        tool_calls=tool_calls,
+        tool_call_counts=tool_call_counts,
+        tool_call_time_s=tool_call_time_s,
+        tool_call_tokens={name: tu.as_dict() for name, tu in tool_call_tokens.items()},
+        reasoning_tokens=usage.reasoning_tokens,
     )
 
     # One self-contained JSONL record with everything the old text log held.
@@ -277,6 +315,11 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
         "cache_mode": cache_mode,
         "max_rounds": max_rounds,
         "rounds_used": rounds_used,
+        "hit_cap": hit_cap,
+        "tool_calls": tool_calls,
+        "tool_call_counts": tool_call_counts,
+        "tool_call_time_s": tool_call_time_s,
+        "tool_call_tokens": {name: tu.as_dict() for name, tu in tool_call_tokens.items()},
         "question": question,
         "expected": expected,
         "expected_normalized": expected_norm,
@@ -290,28 +333,18 @@ def answer_question(*, question: str, tool_name: str, client: LLMClient,
         "answerer": {
             "context": answerer.context,
             "output": answerer.text,
-            "usage": {
-                "input": answerer.usage.input_tokens,
-                "output": answerer.usage.output_tokens,
-                "total": answerer.usage.total_tokens,
-                "cached": answerer.usage.cached_tokens,
-                "cost_usd": answerer.usage.cost_usd,
-            },
+            "usage": answerer.usage.as_dict(),
         },
-        "usage_total": {
-            "input": usage.input_tokens,
-            "output": usage.output_tokens,
-            "total": usage.total_tokens,
-            "cached": usage.cached_tokens,
-            "cost_usd": usage.cost_usd,
-        },
+        "usage_total": usage.as_dict(),
         "latency_s": latency_s,
         "tool_time_s": round(tool_time_s, 4),
     })
 
-    log.info("[%s] answer=%r rounds=%d/%d tokens(in/out/total)=%d/%d/%d cached=%d cost=$%.6f time=%.2fs",
-             tool_name, result.answer, rounds_used, max_rounds,
+    log.info("[%s] answer=%r rounds=%d (cap %d) tool_calls=%d "
+             "tokens(in/out/total)=%d/%d/%d cached=%d reasoning=%d cost=$%.6f time=%.2fs",
+             tool_name, result.answer, rounds_used, max_rounds, tool_calls,
              result.usage.input_tokens, result.usage.output_tokens,
-             result.usage.total_tokens, result.usage.cached_tokens, result.usage.cost_usd,
+             result.usage.total_tokens, result.usage.cached_tokens,
+             result.usage.reasoning_tokens, result.usage.cost_usd,
              result.latency_s)
     return result

@@ -11,6 +11,7 @@ Exposes :data:`ALL_TOOLS`, :data:`TOOL_NAMES`, :func:`get_tool`,
 import logging
 
 from .grep import grep_tool
+from .rg_index import rg_index_tool, rg_index
 from .lsp import lsp_tool, lsp_server
 from .rag import rag_tool, rag_index
 from .shell import shell_tool
@@ -18,8 +19,10 @@ from .read import read_file
 
 log = logging.getLogger("repoqa.tools")
 
-#: All benchmarked (primary) tools, in display order.
-ALL_TOOLS = [grep_tool, lsp_tool, rag_tool, shell_tool]
+#: All benchmarked (primary) tools, in display order. Two lexical conditions:
+#: ``grep_tool`` (online GNU grep, live scan) and ``rg_index_tool`` (ripgrep over
+#: a prebuilt file index); plus semantic LSP, semantic RAG, and the shell.
+ALL_TOOLS = [grep_tool, rg_index_tool, lsp_tool, rag_tool, shell_tool]
 #: Names of all benchmarked (primary) tools.
 TOOL_NAMES = [t.name for t in ALL_TOOLS]
 
@@ -29,7 +32,7 @@ SHARED_READ_TOOL = read_file
 #: Which primary tools additionally get the shared read tool. ``shell_tool`` is
 #: excluded: it can already read files natively, so adding read_file would
 #: double-count the same capability and blur its metrics.
-_TOOLS_WITH_READ = {"grep_tool", "lsp_tool", "rag_tool"}
+_TOOLS_WITH_READ = {"grep_tool", "rg_index_tool", "lsp_tool", "rag_tool"}
 
 _BY_NAME = {t.name: t for t in ALL_TOOLS}
 
@@ -62,16 +65,22 @@ def get_secondary_tools(name: str) -> list:
 def warmup(name: str) -> None:
     """Prime a tool's heavy one-time cost before latency is measured.
 
-    Builds the RAG index / loads the embedding model, or starts the LSP server,
-    so the first question's timing reflects steady-state cost. ``grep`` has no
-    warmup cost.
+    Builds the RAG index / loads the embedding model, builds the ripgrep file
+    index, or starts the LSP server, so the first question's timing reflects
+    steady-state cost. Online ``grep`` has no warmup cost (it scans live).
 
     :param name: Tool name to warm up.
     """
     if name == "rag_tool":
         rag_index.build()
+    elif name == "rg_index_tool":
+        rg_index.build()
     elif name == "lsp_tool":
         try:
             lsp_server.ensure_started()
+            # Fairness: force-index every in-scope file now so each question
+            # faces the same (fully warm) clangd index, not one that grows with
+            # run order. Mirrors rg_index building its full file list at warmup.
+            lsp_server.preindex_scope()
         except Exception as exc:  # noqa: BLE001
             log.warning("LSP warmup failed (%s)", exc)

@@ -9,3 +9,9 @@ __pycache__/
 # Caches / artifacts
 .rag_cache/
 #logs/ temp
+/kernel
+.qdrant_cache/
+.rg_index_cache/
+/logs
+/data
+ladder.json

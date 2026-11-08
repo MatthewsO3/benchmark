@@ -207,9 +207,11 @@ def plot_sweep(sweep_dir: str) -> str:
         metrics.append(("accuracy", f"Accuracy — {cat} (%)", 100.0, "%.0f", cat))
     metrics += [
         ("mean_total_tokens", "Mean total tokens / q", 1.0, "%.0f", None),
+        ("mean_reasoning_tokens", "Mean reasoning tokens / q", 1.0, "%.0f", None),
         ("mean_time_s", "Mean latency (s) / q", 1.0, "%.1f", None),
         ("mean_tool_time_s", "Mean tool time (s) / q", 1.0, "%.3f", None),
         ("mean_cost_usd", "Mean cost ($) / q", 1.0, "%.5f", None),
+        ("mean_tool_calls", "Mean tool calls / q", 1.0, "%.2f", None),
         ("mean_rounds", "Mean rounds used", 1.0, "%.2f", None),
     ]
 
@@ -251,3 +253,248 @@ def plot_sweep(sweep_dir: str) -> str:
     print(f"saved sweep comparison -> {out_png}")
     plt.show()
     return out_png
+
+
+# ---------------------------------------------------------------------------
+# Ladder (codebase-scaling) plots
+# ---------------------------------------------------------------------------
+
+def _load_cell_summary(cell_path: str):
+    """Return the per-tool summary dict from one ladder cell transcript.
+
+    Each cell file is a benchmark JSONL run of exactly one (rung, tool); its
+    ``summary`` record holds a single tool whose summary carries the metrics
+    plus ladder metadata (``rung``, ``rung_size``, ``by_category``).
+
+    :param cell_path: Path to the cell ``.jsonl``.
+    :return: The single tool's summary dict, or ``None`` if absent.
+    """
+    summary_rec = None
+    with open(cell_path, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("type") == "summary":
+                summary_rec = rec
+    if not summary_rec or not summary_rec.get("tools"):
+        return None
+    # One tool per cell; return its summary.
+    return next(iter(summary_rec["tools"].values()))
+
+
+def _collect_ladder(exp_dir: str):
+    """Collect every (rung, tool) cell under a ladder experiment directory.
+
+    Prefers the ``manifest.json`` index; falls back to globbing
+    ``<rung>__<tool>.jsonl`` files if no manifest is present.
+
+    :param exp_dir: The experiment directory (holds cells + manifest).
+    :return: Tuple ``(cells, ladder_name)`` where ``cells`` is a list of dicts
+        ``{rung, tool, ch_loc, ch_files, summary}`` and ``ladder_name`` is the
+        ladder file name (or ``None``).
+    :raises SystemExit: If no cells are found.
+    """
+    manifest_path = os.path.join(exp_dir, "manifest.json")
+    cell_files = []
+    ladder_name = None
+    if os.path.exists(manifest_path):
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        ladder_name = manifest.get("ladder")
+        for cell in manifest.get("cells", []):
+            cell_files.append(os.path.join(exp_dir, cell["path"]))
+    else:
+        cell_files = sorted(glob.glob(os.path.join(exp_dir, "*__*.jsonl")))
+    if not cell_files:
+        raise SystemExit(f"no ladder cells (*.jsonl / manifest) found in {exp_dir}/")
+
+    cells = []
+    for path in cell_files:
+        if not os.path.exists(path):
+            continue
+        summary = _load_cell_summary(path)
+        if summary is None:
+            continue
+        rung_size = summary.get("rung_size") or {}
+        cells.append({
+            "rung": summary.get("rung"),
+            "tool": summary.get("tool") or _tool_from_name(path),
+            "ch_loc": rung_size.get("ch_loc") or summary.get("ch_loc"),
+            "ch_files": rung_size.get("ch_files"),
+            "summary": summary,
+        })
+    if not cells:
+        raise SystemExit(f"no readable summaries in the cells under {exp_dir}/")
+    return cells, ladder_name
+
+
+def _tool_from_name(cell_path: str) -> str:
+    """Infer the tool name from a ``<rung>__<tool>.jsonl`` filename.
+
+    :param cell_path: Path to the cell file.
+    :return: The tool portion of the name (best-effort).
+    """
+    base = os.path.splitext(os.path.basename(cell_path))[0]
+    return base.split("__", 1)[1] if "__" in base else base
+
+
+def _ladder_categories(cells: list) -> list:
+    """Return the sorted question categories present across cells.
+
+    :param cells: The collected cell dicts.
+    :return: Category names (excluding the ``uncategorized`` bucket).
+    """
+    cats = []
+    for c in cells:
+        for cat in (c["summary"].get("by_category") or {}):
+            if cat not in cats:
+                cats.append(cat)
+    return [c for c in sorted(cats) if c != "uncategorized"]
+
+
+def plot_ladder(exp_dir: str, *, out_path: str = None) -> str:
+    """Plot every metric vs codebase size, one line per tool, for a ladder run.
+
+    The subsystem ladder grows the indexed codebase across rungs while asking
+    the same questions, so the natural view is each metric as a function of
+    codebase size (``ch_loc``), with one line per tool. Accuracy is broken out
+    into an overall panel plus one panel per question category; the remaining
+    panels cover token usage (total + reasoning), cost, latency, tool time and
+    tool-call count — so the whole picture of "how does each tool scale as the
+    haystack grows?" is one figure.
+
+    :param exp_dir: The ladder experiment directory (cells + ``manifest.json``).
+    :param out_path: Output PNG path; defaults to ``ladder_comparison.png`` in
+        ``exp_dir``.
+    :return: Path to the saved PNG.
+    """
+    cells, ladder_name = _collect_ladder(exp_dir)
+
+    # Organize: tool -> sorted list of (ch_loc, rung, summary).
+    tools = []
+    by_tool = {}
+    for c in cells:
+        by_tool.setdefault(c["tool"], []).append(c)
+        if c["tool"] not in tools:
+            tools.append(c["tool"])
+    tools.sort()
+    for tool in tools:
+        by_tool[tool].sort(key=lambda c: (c["ch_loc"] or 0))
+
+    categories = _ladder_categories(cells)
+
+    # Discover every sub-tool that was actually invoked across the run (e.g.
+    # the search tool under test plus ``read_file``), so the per-sub-tool
+    # call-count and time panels adapt to whatever tools the setup exposed.
+    sub_tools = []
+    for c in cells:
+        for name in (c["summary"].get("per_tool") or {}):
+            if name not in sub_tools:
+                sub_tools.append(name)
+    sub_tools.sort()
+
+    # (summary key, panel title, scale, value format, category-or-None).
+    # Accuracy first (overall + per category), then the full token breakdown
+    # (input / output / cached / reasoning / total), cost, wall-clock latency,
+    # rounds, and aggregate tool-use. Per-sub-tool call/time panels are appended
+    # afterwards so every metric the benchmark records is visualized.
+    metrics = [("accuracy", "Accuracy — overall (%)", 100.0, "%.0f", None)]
+    for cat in categories:
+        metrics.append(("accuracy", f"Accuracy — {cat} (%)", 100.0, "%.0f", cat))
+    metrics += [
+        ("mean_input_tokens", "Mean input tokens / q", 1.0, "%.0f", None),
+        ("mean_output_tokens", "Mean output tokens / q", 1.0, "%.0f", None),
+        ("mean_reasoning_tokens", "Mean reasoning tokens / q", 1.0, "%.0f", None),
+        ("mean_cached_tokens", "Mean cached tokens / q", 1.0, "%.0f", None),
+        ("mean_total_tokens", "Mean total tokens / q", 1.0, "%.0f", None),
+        ("mean_cost_usd", "Mean cost ($) / q", 1.0, "%.5f", None),
+        ("mean_time_s", "Mean wall-clock latency (s) / q", 1.0, "%.1f", None),
+        ("mean_rounds", "Mean rounds used / q", 1.0, "%.2f", None),
+        ("mean_tool_calls", "Mean tool calls / q (all tools)", 1.0, "%.2f", None),
+        ("mean_tool_time_s", "Mean tool time (s) / q (all tools)", 1.0, "%.3f", None),
+    ]
+    # Per-sub-tool breakdown: how many calls and how much wall time each
+    # individual tool (search tool, read_file, ...) accounted for, averaged
+    # per question. ``("__subtool__", name, field)`` is a sentinel the value
+    # reader below understands.
+    for name in sub_tools:
+        metrics.append(("__subtool__", f"{name}: calls / q", 1.0, "%.2f",
+                        (name, "calls")))
+        metrics.append(("__subtool__", f"{name}: time (s) / q", 1.0, "%.3f",
+                        (name, "time_s")))
+
+    def _value(summary, key, category):
+        """Pull a metric from a summary.
+
+        Handles three cases: per-category accuracy (``category`` is a string),
+        a per-sub-tool mean (``key == "__subtool__"`` and ``category`` is a
+        ``(tool_name, field)`` tuple, divided by ``n`` to get a per-question
+        mean), and a flat top-level metric otherwise.
+        """
+        if key == "__subtool__":
+            name, field = category
+            entry = (summary.get("per_tool") or {}).get(name) or {}
+            n = summary.get("n") or 1
+            return entry.get(field, 0) / n
+        if category is not None:
+            entry = (summary.get("by_category") or {}).get(category) or {}
+            return entry.get("accuracy", 0)
+        return summary.get(key, 0)
+
+    cols = 3
+    rows = (len(metrics) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(6 * cols, 4 * rows))
+    axes = axes.flatten()
+
+    title = "Ladder — metrics vs codebase size"
+    if ladder_name:
+        title += f"  ({ladder_name})"
+    fig.suptitle(title, fontsize=15)
+
+    for axis, (key, label, scale, fmt, category) in zip(axes, metrics):
+        for ti, tool in enumerate(tools):
+            series = by_tool[tool]
+            xs = [c["ch_loc"] for c in series]
+            ys = [_value(c["summary"], key, category) * scale for c in series]
+            axis.plot(xs, ys, marker=_marker(ti), color=_COLORS[ti % len(_COLORS)],
+                      label=tool, linewidth=1.9, markersize=7)
+            for x, y in zip(xs, ys):
+                axis.annotate(fmt % y, (x, y), textcoords="offset points",
+                              xytext=(0, 7), ha="center", fontsize=7)
+        axis.set_title(label)
+        axis.set_xlabel("codebase size (lines of C/H)")
+        axis.set_xscale("log")  # rungs span ~145k -> 1M -> 4M; log reads better
+        axis.grid(alpha=0.3, which="major")
+        if key == "accuracy":
+            axis.set_ylim(0, 100)
+        # Show ONLY the rung ticks (suppress matplotlib's dense log minor/major
+        # ticks, which otherwise collide with the rung labels).
+        all_x = sorted({c["ch_loc"] for c in cells if c["ch_loc"]})
+        if all_x:
+            from matplotlib.ticker import NullLocator
+            axis.xaxis.set_minor_locator(NullLocator())
+            axis.set_xticks(all_x)
+            rung_by_x = {c["ch_loc"]: c["rung"] for c in cells if c["ch_loc"]}
+            axis.set_xticklabels(
+                [f"{rung_by_x.get(x, '')}\n{x/1e6:.2f}M LOC" for x in all_x],
+                fontsize=8)
+            # A little horizontal padding so edge markers/labels aren't clipped.
+            axis.set_xlim(min(all_x) * 0.8, max(all_x) * 1.25)
+
+    for axis in axes[len(metrics):]:
+        axis.axis("off")
+
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower right", ncol=max(1, len(tools)), fontsize=10)
+
+    plt.tight_layout(rect=(0, 0.02, 1, 0.95))
+    out_path = out_path or os.path.join(exp_dir, "ladder_comparison.png")
+    plt.savefig(out_path, dpi=130)
+    print(f"saved ladder plot -> {out_path}")
+    plt.close(fig)
+    return out_path

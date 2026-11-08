@@ -15,6 +15,7 @@ import os
 import shutil
 import logging
 import threading
+import subprocess
 
 from langchain_core.tools import tool
 
@@ -29,6 +30,32 @@ _MAX_HITS = 10
 _MAX_SNIPPET_LINES = 80
 #: Seconds to wait for clangd to answer a request.
 _LSP_TIMEOUT = 30.0
+#: Max candidate files opened (didOpen) to force-index a symbol on a miss.
+_MAX_OPEN_CANDIDATES = 5
+#: Seconds to wait for clangd to index freshly-opened files before retrying.
+_INDEX_SETTLE_S = 2.0
+
+
+def _find_clangd():
+    """Locate a clangd executable, preferring PATH then the active venv.
+
+    The ``clangd`` PyPI wheel installs the binary into the environment's
+    ``bin``/``Scripts`` dir, which is on PATH under ``uv run`` but not always
+    otherwise. Check PATH first, then the running interpreter's bin dir so the
+    tool works even when the venv is not activated.
+
+    :return: Absolute path to clangd, or ``None`` if not found.
+    """
+    found = shutil.which("clangd")
+    if found:
+        return found
+    import sys
+    bindir = os.path.dirname(sys.executable)
+    for name in ("clangd", "clangd.exe"):
+        candidate = os.path.join(bindir, name)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
 
 
 def _bracket_delta(line: str) -> int:
@@ -117,6 +144,7 @@ class LspServer:
         self._client = None
         self._process = None
         self._unavailable = None  # cached reason string once known unavailable
+        self._opened = set()      # file URIs already sent via didOpen
 
     def ensure_started(self) -> None:
         """Start clangd and initialize the LSP session if not already running.
@@ -131,14 +159,14 @@ class LspServer:
         if self._unavailable:
             raise RuntimeError(self._unavailable)
 
-        clangd_path = shutil.which("clangd")
+        clangd_path = _find_clangd()
         if not clangd_path:
-            self._unavailable = "clangd not found on PATH"
+            self._unavailable = ("clangd not found (install it with "
+                                 "`uv pip install clangd`, or put it on PATH)")
             raise RuntimeError(self._unavailable)
 
         import subprocess
         from pylspclient import LspClient, LspEndpoint, JsonRpcEndpoint
-
         repo = os.path.abspath(config.TARGET_REPO)
         log.info("LSP: starting clangd for %s ...", repo)
         # --background-index lets clangd build its index so workspace/symbol has
@@ -164,6 +192,50 @@ class LspServer:
         self._client.initialized()
         log.info("LSP: clangd ready")
 
+    def preindex_scope(self) -> int:
+        """Force-index EVERY in-scope source file at warmup (``didOpen`` each).
+
+        Fairness invariant: clangd's ``--background-index`` warms lazily, so
+        without this the index grows *during* the run — a symbol lookup that
+        misses early (and must fall back to the slow candidate ``didOpen``
+        retry) may hit cleanly later, once background indexing or an earlier
+        question's fallback has parsed its file. That makes a question's result
+        and latency depend on run order and biases the LSP condition
+        optimistically versus the stateless grep/ripgrep tools.
+
+        Opening every in-scope file up front removes that: when the first
+        question runs, the whole rung is already parsed and in the index, so
+        every question faces the SAME index state and the same chance of a
+        first-try hit — the semantic analogue of ripgrep's "build the file
+        index once at warmup, then every query sees it".
+
+        Scope-aware: when a ladder rung is active this opens exactly the rung's
+        files (never the whole tree), so each rung pre-indexes only its own
+        scope. Idempotent per file (``_did_open`` skips already-open URIs), so
+        the per-question fallback adds nothing new afterwards.
+
+        :return: The number of files opened (``didOpen`` sent).
+        """
+        self.ensure_started()
+        from ..ladder import active_scope, scope_file_list
+        from .common import walk_repo
+        if active_scope() is not None:
+            files = scope_file_list()
+        else:
+            files = list(walk_repo(os.path.abspath(config.TARGET_REPO)))
+        log.info("LSP: pre-indexing %d in-scope file(s) at warmup ...", len(files))
+        opened = 0
+        for path in files:
+            if self._did_open(path):
+                opened += 1
+        # Let clangd finish parsing the just-opened TUs before queries start, so
+        # the first question sees a settled index like every later one.
+        if opened:
+            import time
+            time.sleep(_INDEX_SETTLE_S)
+        log.info("LSP: pre-index complete (%d file(s) opened)", opened)
+        return opened
+
     def _workspace_symbol(self, symbol: str):
         """Issue a raw ``workspace/symbol`` request (not wrapped by pylspclient).
 
@@ -171,6 +243,88 @@ class LspServer:
         :return: The raw list of SymbolInformation dicts (possibly empty/None).
         """
         return self._client.lsp_endpoint.call_method("workspace/symbol", query=symbol)
+
+    def _did_open(self, path: str) -> bool:
+        """Send ``textDocument/didOpen`` for ``path`` so clangd indexes it now.
+
+        clangd's ``--background-index`` warms lazily, so a fresh
+        ``workspace/symbol`` query can miss a symbol whose file has not been
+        parsed yet. Opening the file forces an immediate parse+index, which is
+        what makes the subsequent lookup deterministic. Already-opened files are
+        skipped.
+
+        :param path: Absolute path to a source file to open.
+        :return: ``True`` if a didOpen was sent (or already open), ``False`` on
+            read error.
+        """
+        uri = f"file://{path}"
+        if uri in self._opened:
+            return True
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as handle:
+                text = handle.read()
+        except OSError:
+            return False
+        try:
+            self._client.didOpen({
+                "uri": uri,
+                "languageId": config.SOURCE_LANGUAGE or "c",
+                "version": 1,
+                "text": text,
+            })
+        except Exception as exc:  # noqa: BLE001
+            log.warning("LSP: didOpen failed for %s (%s)", path, exc)
+            return False
+        self._opened.add(uri)
+        return True
+
+    def _candidate_files(self, symbol: str) -> list:
+        """Find source files likely to define ``symbol`` (a quick lexical scan).
+
+        Used only to force-index on a ``workspace/symbol`` miss: a tiny ripgrep
+        (or Python fallback) for the bare symbol name, scoped to in-scope C
+        sources, yields the files to ``didOpen`` so clangd parses them and the
+        retry query can resolve the symbol semantically.
+
+        :param symbol: The symbol name to locate candidate files for.
+        :return: Up to :data:`_MAX_OPEN_CANDIDATES` absolute file paths.
+        """
+        repo = os.path.abspath(config.TARGET_REPO)
+        from ..ladder import in_scope
+        command = ["rg", "-l", "-w", "--no-messages"]
+        for glob in config.SOURCE_GLOBS:
+            command += ["-g", glob]
+        command += ["-e", symbol, repo]
+        try:
+            completed = subprocess.run(
+                command, capture_output=True, text=True, timeout=60,
+                encoding="utf-8", errors="replace",
+            )
+            if completed.returncode in (0, 1):
+                # Containment: never open a file outside the active rung scope,
+                # or the fallback could pull in (and reveal) out-of-scope code.
+                paths = [p for p in completed.stdout.splitlines()
+                         if p.strip() and in_scope(p)]
+                return paths[:_MAX_OPEN_CANDIDATES]
+        except (FileNotFoundError, OSError):
+            pass
+        # Fallback: Python scan (rg missing). Bounded to the first few matches.
+        from .common import walk_repo
+        import re
+        rx = re.compile(rf"\b{re.escape(symbol)}\b")
+        hits = []
+        for path in walk_repo(repo):
+            if not in_scope(path):
+                continue
+            try:
+                with open(path, encoding="utf-8", errors="ignore") as handle:
+                    if rx.search(handle.read()):
+                        hits.append(path)
+                        if len(hits) >= _MAX_OPEN_CANDIDATES:
+                            break
+            except OSError:
+                continue
+        return hits
 
     def lookup(self, symbol: str) -> str:
         """Look up ``symbol`` and return each definition's location and source.
@@ -189,6 +343,26 @@ class LspServer:
             hits = self._workspace_symbol(symbol) or []
         except Exception as exc:  # noqa: BLE001
             return f"lsp query error: {exc}"
+
+        if not hits:
+            # Background index may not have reached this symbol's file yet.
+            # Force-index the files that lexically mention it (didOpen), let
+            # clangd settle briefly, then retry the semantic query. This keeps
+            # the result AST-accurate while making the first lookup reliable on
+            # a freshly-started server over a large tree like the kernel.
+            candidates = self._candidate_files(symbol)
+            opened = 0
+            for path in candidates:
+                if self._did_open(path):
+                    opened += 1
+            if opened:
+                import time
+                time.sleep(_INDEX_SETTLE_S)
+                try:
+                    hits = self._workspace_symbol(symbol) or []
+                except Exception as exc:  # noqa: BLE001
+                    return f"lsp query error: {exc}"
+
         if not hits:
             return "symbol not found"
 
@@ -202,6 +376,36 @@ class LspServer:
             snippet = _definition_snippet(path, line)
             blocks.append(f"[{path}:{line + 1}] {name}\n{snippet}")
         return "\n---\n".join(blocks)
+
+    def close(self) -> None:
+        """Shut down clangd cleanly, releasing its subprocess.
+
+        Without an explicit shutdown the clangd child keeps its stdio open and
+        the interpreter can block at exit. We skip the LSP ``shutdown``/``exit``
+        handshake (it can itself hang waiting on a reply) and just close our
+        pipes and terminate the child, which is reliable. Safe to call more than
+        once; registered at interpreter exit.
+        """
+        client, self._client = self._client, None
+        process, self._process = self._process, None
+        self._opened.clear()
+        if process is not None:
+            # Close our ends of the pipes so clangd sees EOF on stdin and we do
+            # not block on its stdout, then terminate/kill the child.
+            for stream in (process.stdin, process.stdout):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except Exception:  # noqa: BLE001
+                try:
+                    process.kill()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 def _get(obj, key, default=None):
@@ -224,6 +428,12 @@ def _get(obj, key, default=None):
 
 #: Shared language-server instance used by the tool and warmup.
 lsp_server = LspServer()
+
+# Shut clangd down cleanly at interpreter exit (prevents a hang waiting on the
+# child process's stdin, mirroring the RAG index's atexit close).
+import atexit  # noqa: E402
+
+atexit.register(lsp_server.close)
 
 
 @tool
